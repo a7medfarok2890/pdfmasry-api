@@ -305,8 +305,7 @@ async def pdf_to_excel(file: UploadFile = File(...)):
 
 ---
 
-والـ `requirements.txt` كمان — شيل `tabula-py` و`jpype1` وأضيف `requests`:
-```
+# remove tabula, add requests```
 fastapi
 uvicorn
 python-multipart
