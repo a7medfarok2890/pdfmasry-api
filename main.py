@@ -2,13 +2,13 @@ from fastapi import FastAPI, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from pdf2docx import Converter
-import tabula
-import pandas as pd
 import subprocess
 import tempfile
 import os
 import shutil
 import zipfile
+import requests
+import time
 
 app = FastAPI(title="PDFMasry API")
 
@@ -21,6 +21,7 @@ app.add_middleware(
 )
 
 UPLOAD_DIR = tempfile.mkdtemp(prefix="pdfmasry_")
+PDFCO_API_KEY = os.environ.get("PDFCO_API_KEY", "")
 
 
 def cleanup(*paths):
@@ -241,28 +242,75 @@ async def pdf_to_excel(file: UploadFile = File(...)):
         f.write(await file.read())
 
     try:
-        tables = tabula.read_pdf(
-            input_path,
-            pages="all",
-            multiple_tables=True,
-            silent=True,
-            lattice=True,
-            stream=True,
-            guess=True,
-            pandas_options={"header": None}
-        )
-        if not tables:
-            return JSONResponse({"error": "لم يتم العثور على جداول في الملف"}, status_code=400)
+        # Step 1: رفع الملف على PDF.co
+        with open(input_path, "rb") as f:
+            upload_res = requests.post(
+                "https://api.pdf.co/v1/file/upload",
+                headers={"x-api-key": PDFCO_API_KEY},
+                files={"file": (safe_name, f, "application/pdf")}
+            )
+        upload_data = upload_res.json()
+        if not upload_data.get("url"):
+            raise RuntimeError("فشل رفع الملف على PDF.co")
 
-        with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
-            for i, table in enumerate(tables):
-                sheet_name = f"Table_{i+1}"
-                table.to_excel(writer, sheet_name=sheet_name, index=False, header=False)
+        uploaded_url = upload_data["url"]
+
+        # Step 2: طلب التحويل
+        convert_res = requests.post(
+            "https://api.pdf.co/v1/pdf/convert/to/xls",
+            headers={"x-api-key": PDFCO_API_KEY, "Content-Type": "application/json"},
+            json={
+                "url": uploaded_url,
+                "name": f"{base_name}.xlsx",
+                "async": True
+            }
+        )
+        convert_data = convert_res.json()
+        if convert_data.get("error"):
+            raise RuntimeError(convert_data.get("message", "فشل التحويل"))
+
+        job_id = convert_data.get("jobId")
+
+        # Step 3: انتظار النتيجة
+        for _ in range(30):
+            time.sleep(2)
+            check_res = requests.get(
+                f"https://api.pdf.co/v1/job/check?jobid={job_id}",
+                headers={"x-api-key": PDFCO_API_KEY}
+            )
+            check_data = check_res.json()
+            status = check_data.get("status")
+            if status == "success":
+                result_url = check_data.get("url")
+                break
+            elif status == "failed":
+                raise RuntimeError("فشل التحويل في PDF.co")
+        else:
+            raise RuntimeError("انتهت مهلة التحويل")
+
+        # Step 4: تحميل الملف
+        file_res = requests.get(result_url)
+        with open(output_path, "wb") as f:
+            f.write(file_res.content)
 
         return FileResponse(
             output_path,
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             filename=f"{base_name}.xlsx"
         )
+
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
+```
+
+---
+
+والـ `requirements.txt` كمان — شيل `tabula-py` و`jpype1` وأضيف `requests`:
+```
+fastapi
+uvicorn
+python-multipart
+pdf2docx
+pandas
+openpyxl
+requests
