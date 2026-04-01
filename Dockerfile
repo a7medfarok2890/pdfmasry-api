@@ -4,9 +4,7 @@ RUN apt-get update && apt-get install -y \
     qpdf \
     libreoffice \
     poppler-utils \
-    libsm6 \
-    libxext6 \
-    libgl1 \
+    default-jre-headless \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
