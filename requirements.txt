@@ -5,4 +5,3 @@ pdf2docx
 camelot-py[cv]
 pandas
 openpyxl
-ghostscript
