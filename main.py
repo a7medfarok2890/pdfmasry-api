@@ -241,14 +241,17 @@ async def pdf_to_excel(file: UploadFile = File(...)):
         f.write(await file.read())
 
     try:
-        tables = tabula.read_pdf(input_path, pages="all", multiple_tables=True, silent=True)
-        if not tables:
+        import camelot
+        tables = camelot.read_pdf(input_path, pages="all", flavor="lattice")
+        if tables.n == 0:
+            tables = camelot.read_pdf(input_path, pages="all", flavor="stream")
+        if tables.n == 0:
             return JSONResponse({"error": "لم يتم العثور على جداول في الملف"}, status_code=400)
 
         with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
             for i, table in enumerate(tables):
                 sheet_name = f"Table_{i+1}"
-                table.to_excel(writer, sheet_name=sheet_name, index=False)
+                table.df.to_excel(writer, sheet_name=sheet_name, index=False, header=False)
 
         return FileResponse(
             output_path,
