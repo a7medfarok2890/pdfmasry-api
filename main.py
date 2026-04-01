@@ -301,7 +301,4 @@ async def pdf_to_excel(file: UploadFile = File(...)):
 
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
-```
-
----
 
