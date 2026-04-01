@@ -305,11 +305,3 @@ async def pdf_to_excel(file: UploadFile = File(...)):
 
 ---
 
-# remove tabula, add requests```
-fastapi
-uvicorn
-python-multipart
-pdf2docx
-pandas
-openpyxl
-requests
