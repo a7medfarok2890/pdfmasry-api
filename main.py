@@ -2,7 +2,7 @@ from fastapi import FastAPI, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from pdf2docx import Converter
-import tabula
+import camelot
 import pandas as pd
 import subprocess
 import tempfile
@@ -241,7 +241,6 @@ async def pdf_to_excel(file: UploadFile = File(...)):
         f.write(await file.read())
 
     try:
-        import camelot
         tables = camelot.read_pdf(input_path, pages="all", flavor="lattice")
         if tables.n == 0:
             tables = camelot.read_pdf(input_path, pages="all", flavor="stream")
