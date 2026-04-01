@@ -2,6 +2,8 @@ from fastapi import FastAPI, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from pdf2docx import Converter
+import tabula
+import pandas as pd
 import subprocess
 import tempfile
 import os
@@ -225,5 +227,33 @@ async def pdf_to_text(file: UploadFile = File(...), layout: bool = Form(False)):
         return JSONResponse({"text": text, "characters": len(text), "words": len(text.split())})
     except subprocess.CalledProcessError as e:
         return JSONResponse({"error": e.stderr.decode(errors="replace")}, status_code=500)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.post("/pdf-to-excel")
+async def pdf_to_excel(file: UploadFile = File(...)):
+    work_dir, input_path, safe_name = save_upload(file, prefix="")
+    base_name = os.path.splitext(safe_name)[0]
+    output_path = os.path.join(work_dir, f"{base_name}.xlsx")
+
+    with open(input_path, "wb") as f:
+        f.write(await file.read())
+
+    try:
+        tables = tabula.read_pdf(input_path, pages="all", multiple_tables=True, silent=True)
+        if not tables:
+            return JSONResponse({"error": "لم يتم العثور على جداول في الملف"}, status_code=400)
+
+        with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+            for i, table in enumerate(tables):
+                sheet_name = f"Table_{i+1}"
+                table.to_excel(writer, sheet_name=sheet_name, index=False)
+
+        return FileResponse(
+            output_path,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            filename=f"{base_name}.xlsx"
+        )
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
