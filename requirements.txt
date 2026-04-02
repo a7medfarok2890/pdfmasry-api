@@ -2,7 +2,3 @@ fastapi
 uvicorn
 python-multipart
 pdf2docx
-tabula-py
-pandas
-openpyxl
-jpype1
