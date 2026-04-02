@@ -236,15 +236,14 @@ async def pdf_to_excel(
     file: UploadFile = File(...),
     ocr: bool = Form(False)
 ):
-    """تحويل PDF إلى Excel (.xlsx) مع استخراج الجداول"""
     payload = {
         "name": "output.xlsx",
         "lang": "ara+eng",
-        "ocr"  : ocr,
+        "ocr": ocr,
         "inline": False,
     }
     return await full_convert(
-        file, "pdf/convert/to/xls", payload,
+        file, "pdf/convert/to/xlsx", payload,
         "converted.xlsx",
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         bg
