@@ -105,11 +105,12 @@ async def pdfco_upload(local_path: str) -> str:
 
 
 async def pdfco_job(endpoint: str, payload: dict) -> dict:
-    """إرسال job إلى pdf.co وانتظار النتيجة (async polling)"""
-    # Enable async mode for long jobs
-    payload["async"] = True
+    """إرسال job إلى pdf.co وانتظار النتيجة"""
+    # نستخدم sync mode عشان ناخد الرابط مباشرة بدون polling
+    payload["async"] = False
+    payload["inline"] = False
 
-    async with httpx.AsyncClient(timeout=60) as client:
+    async with httpx.AsyncClient(timeout=120) as client:
         r = await client.post(
             f"{PDFCO_BASE}/{endpoint}",
             json=payload,
@@ -118,37 +119,12 @@ async def pdfco_job(endpoint: str, payload: dict) -> dict:
         r.raise_for_status()
         data = r.json()
 
+    log.info(f"pdf.co response: {data}")
+
     if data.get("error"):
         raise RuntimeError(data.get("message", "pdf.co error"))
 
-    # إذا كان sync وجاء بـ url مباشرة
-    if data.get("url") or data.get("urls"):
-        return data
-
-    # Polling لو async
-    job_id = data.get("jobId")
-    if not job_id:
-        raise RuntimeError("No jobId returned from pdf.co")
-
-    deadline = time.time() + MAX_POLL_WAIT
-    async with httpx.AsyncClient(timeout=30) as client:
-        while time.time() < deadline:
-            await asyncio.sleep(POLL_INTERVAL)
-            check = await client.get(
-                f"{PDFCO_BASE}/job/check",
-                params={"jobid": job_id},
-                headers={"x-api-key": API_KEY}
-            )
-            check.raise_for_status()
-            status = check.json()
-            log.info(f"Job {job_id} status: {status.get('status')}")
-
-            if status.get("status") == "success":
-                return status
-            if status.get("status") in ("error", "failed", "aborted"):
-                raise RuntimeError(f"Job failed: {status.get('message', status)}")
-
-    raise TimeoutError("انتهت مدة الانتظار — الملف كبير جداً أو الخادم مشغول")
+    return data
 
 
 async def pdfco_download(url: str, out_path: str):
