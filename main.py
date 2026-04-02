@@ -5,16 +5,18 @@ from fastapi import FastAPI, File, UploadFile, BackgroundTasks, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
-# مكتبات أدوبي
-from adobe.pdfservices.operation.auth.credentials import Credentials
-from adobe.pdfservices.operation.execution_context import ExecutionContext
-from adobe.pdfservices.operation.io.file_ref import FileRef
-from adobe.pdfservices.operation.pdfops.export_pdf_operation import ExportPDFOperation
-from adobe.pdfservices.operation.pdfops.options.exportpdf.export_pdf_target_format import ExportPDFTargetFormat
+# --- استدعاء مكتبات أدوبي الحديثة (الإصدار الرابع V4) ---
+from adobe.pdfservices.operation.auth.service_principal_credentials import ServicePrincipalCredentials
+from adobe.pdfservices.operation.pdf_services import PDFServices
+from adobe.pdfservices.operation.pdf_services_media_type import PDFServicesMediaType
+from adobe.pdfservices.operation.pdfjobs.jobs.export_pdf_job import ExportPDFJob
+from adobe.pdfservices.operation.pdfjobs.params.export_pdf.export_pdf_params import ExportPDFParams
+from adobe.pdfservices.operation.pdfjobs.params.export_pdf.export_pdf_target_format import ExportPDFTargetFormat
+from adobe.pdfservices.operation.pdfjobs.result.export_pdf_result import ExportPDFResult
 
-app = FastAPI(title="PDFMasry API", version="2.0")
+app = FastAPI(title="PDFMasry API", version="3.0")
 
-# إعدادات الأمان (CORS) - لحماية السيرفر من الاستخدام الخارجي
+# إعدادات الأمان (CORS) لحماية الباندويث الخاص بك
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -27,48 +29,63 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# مجلد الملفات المؤقتة
 UPLOAD_DIR = "./temp_files"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-# 1. دالة حذف الملفات للتنظيف التلقائي (حماية خصوصية المستخدمين)
+# دالة الحذف التلقائي للملفات بعد نصف ساعة للحفاظ على المساحة والخصوصية
 async def delete_file_after_delay(file_path: str, delay_seconds: int = 1800):
-    """حذف الملفات بعد 30 دقيقة"""
     await asyncio.sleep(delay_seconds)
     if os.path.exists(file_path):
         os.remove(file_path)
 
-# 2. دالة جلب مفاتيح أدوبي من إعدادات Railway
-def get_adobe_credentials():
+# المحرك الأساسي لتحويل الملفات باستخدام Adobe V4
+def process_pdf_adobe_v4(input_path: str, output_path: str, target_format):
     client_id = os.getenv("ADOBE_CLIENT_ID")
     client_secret = os.getenv("ADOBE_CLIENT_SECRET")
     
     if not client_id or not client_secret:
-        raise HTTPException(status_code=500, detail="مفاتيح أدوبي غير مجهزة في السيرفر")
+        raise Exception("مفاتيح أدوبي غير موجودة في بيئة Railway")
         
-    return Credentials.service_principal_credentials_builder() \
-        .with_client_id(client_id) \
-        .with_client_secret(client_secret) \
-        .build()
+    # 1. إعداد الاتصال
+    credentials = ServicePrincipalCredentials(client_id=client_id, client_secret=client_secret)
+    pdf_services = PDFServices(credentials=credentials)
+    
+    # 2. قراءة الملف ورفعه
+    with open(input_path, 'rb') as f:
+        input_stream = f.read()
+    input_asset = pdf_services.upload(input_stream=input_stream, mime_type=PDFServicesMediaType.PDF)
+    
+    # 3. تجهيز المهمة
+    export_pdf_params = ExportPDFParams(target_format=target_format)
+    export_pdf_job = ExportPDFJob(input_asset=input_asset, export_pdf_params=export_pdf_params)
+    
+    # 4. تنفيذ المهمة وجلب النتيجة
+    location = pdf_services.submit(export_pdf_job)
+    pdf_services_response = pdf_services.get_job_result(location, ExportPDFResult)
+    
+    # 5. تحميل الملف الناتج
+    result_asset = pdf_services_response.get_result().get_asset()
+    stream_asset = pdf_services.get_content(result_asset)
+    
+    # 6. حفظ الملف في السيرفر
+    with open(output_path, "wb") as output_file:
+        output_file.write(stream_asset.get_input_stream())
 
-# 3. مسار فحص صحة السيرفر
 @app.get("/")
 def health_check():
-    return {"status": "PDFMasry API is running fast and secure!"}
+    return {"status": "PDFMasry API is running fast with Adobe V4 Engine!"}
 
-# 4. مسار تحميل الملفات بعد المعالجة
 @app.get("/api/download/{filename}")
 def download_file(filename: str):
     file_path = os.path.join(UPLOAD_DIR, filename)
     if os.path.exists(file_path):
         return FileResponse(file_path, filename=filename)
-    raise HTTPException(status_code=404, detail="الملف غير موجود أو انتهت صلاحيته وتم حذفه")
+    raise HTTPException(status_code=404, detail="عذراً، انتهت صلاحية الرابط وتم حذف الملف")
 
-# 5. أداة تحويل PDF إلى Word
 @app.post("/api/pdf-to-word")
 async def convert_pdf_to_word(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
     if not file.filename.lower().endswith('.pdf'):
-        raise HTTPException(status_code=400, detail="يجب رفع ملف بصيغة PDF")
+        raise HTTPException(status_code=400, detail="يجب رفع ملف PDF")
 
     input_path = os.path.join(UPLOAD_DIR, file.filename)
     output_filename = f"word_{file.filename.replace('.pdf', '.docx')}"
@@ -78,29 +95,18 @@ async def convert_pdf_to_word(background_tasks: BackgroundTasks, file: UploadFil
         shutil.copyfileobj(file.file, buffer)
 
     try:
-        credentials = get_adobe_credentials()
-        execution_context = ExecutionContext.create(credentials)
-        export_pdf_operation = ExportPDFOperation.create_new(ExportPDFTargetFormat.DOCX)
-        
-        source_file_ref = FileRef.create_from_local_file(input_path)
-        export_pdf_operation.set_input(source_file_ref)
-        result = export_pdf_operation.execute(execution_context)
-        result.save_as(output_path)
-
+        process_pdf_adobe_v4(input_path, output_path, ExportPDFTargetFormat.DOCX)
         background_tasks.add_task(delete_file_after_delay, input_path)
         background_tasks.add_task(delete_file_after_delay, output_path)
-
         return {"status": "success", "download_url": f"/api/download/{output_filename}"}
-
     except Exception as e:
         background_tasks.add_task(delete_file_after_delay, input_path, delay_seconds=5)
-        raise HTTPException(status_code=500, detail=f"خطأ أثناء التحويل: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"حدث خطأ: {str(e)}")
 
-# 6. أداة تحويل PDF إلى Excel (لجداول المحاسبة)
 @app.post("/api/pdf-to-excel")
 async def convert_pdf_to_excel(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
     if not file.filename.lower().endswith('.pdf'):
-        raise HTTPException(status_code=400, detail="يجب رفع ملف بصيغة PDF")
+        raise HTTPException(status_code=400, detail="يجب رفع ملف PDF")
 
     input_path = os.path.join(UPLOAD_DIR, file.filename)
     output_filename = f"excel_{file.filename.replace('.pdf', '.xlsx')}"
@@ -110,20 +116,10 @@ async def convert_pdf_to_excel(background_tasks: BackgroundTasks, file: UploadFi
         shutil.copyfileobj(file.file, buffer)
 
     try:
-        credentials = get_adobe_credentials()
-        execution_context = ExecutionContext.create(credentials)
-        export_pdf_operation = ExportPDFOperation.create_new(ExportPDFTargetFormat.XLSX)
-        
-        source_file_ref = FileRef.create_from_local_file(input_path)
-        export_pdf_operation.set_input(source_file_ref)
-        result = export_pdf_operation.execute(execution_context)
-        result.save_as(output_path)
-
+        process_pdf_adobe_v4(input_path, output_path, ExportPDFTargetFormat.XLSX)
         background_tasks.add_task(delete_file_after_delay, input_path)
         background_tasks.add_task(delete_file_after_delay, output_path)
-
         return {"status": "success", "download_url": f"/api/download/{output_filename}"}
-
     except Exception as e:
         background_tasks.add_task(delete_file_after_delay, input_path, delay_seconds=5)
-        raise HTTPException(status_code=500, detail=f"خطأ أثناء التحويل: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"حدث خطأ: {str(e)}")
