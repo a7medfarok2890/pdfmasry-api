@@ -2,46 +2,31 @@ from fastapi import FastAPI, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from pdf2docx import Converter
-import subprocess
 import tempfile
 import os
 import shutil
-import zipfile
-import requests
-import time
 
 app = FastAPI(title="PDFMasry API")
 
+# ================= CORS =================
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-    "https://pdfmasry.com",
-    "https://www.pdfmasry.com"
-]
+        "https://pdfmasry.com",
+        "https://www.pdfmasry.com"
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 UPLOAD_DIR = tempfile.mkdtemp(prefix="pdfmasry_")
-PDFCO_API_KEY = os.environ.get("PDFCO_API_KEY", "")
 
 
-def cleanup(*paths):
-    for path in paths:
-        try:
-            if os.path.isfile(path):
-                os.remove(path)
-            elif os.path.isdir(path):
-                shutil.rmtree(path)
-        except Exception:
-            pass
-
-
-def save_upload(upload: UploadFile, prefix="input_"):
-    safe_name = os.path.basename(upload.filename or "file")
+def save_upload(upload: UploadFile):
+    safe_name = os.path.basename(upload.filename or "file.pdf")
     work_dir = tempfile.mkdtemp(dir=UPLOAD_DIR)
-    input_path = os.path.join(work_dir, prefix + safe_name)
+    input_path = os.path.join(work_dir, safe_name)
     return work_dir, input_path, safe_name
 
 
@@ -55,253 +40,44 @@ def health():
     return {"status": "ok"}
 
 
-@app.post("/compress")
-async def compress_pdf(file: UploadFile = File(...), level: str = Form("screen")):
-    allowed = ["screen", "ebook", "printer", "prepress"]
-    if level not in allowed:
-        level = "screen"
-
-    work_dir, input_path, safe_name = save_upload(file)
-    output_path = os.path.join(work_dir, f"compressed_{safe_name}")
-
-    with open(input_path, "wb") as f:
-        f.write(await file.read())
-
-    try:
-        subprocess.run(
-            [
-                "gs", "-sDEVICE=pdfwrite", "-dCompatibilityLevel=1.4",
-                f"-dPDFSETTINGS=/{level}", "-dNOPAUSE", "-dQUIET", "-dBATCH",
-                f"-sOutputFile={output_path}", input_path,
-            ],
-            check=True, capture_output=True,
-        )
-        if not os.path.exists(output_path):
-            raise RuntimeError("Compression output file was not created")
-        return FileResponse(output_path, media_type="application/pdf", filename=f"compressed_{safe_name}")
-    except subprocess.CalledProcessError as e:
-        return JSONResponse({"error": e.stderr.decode(errors="replace")}, status_code=500)
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
-
-
-@app.post("/protect")
-async def protect_pdf(file: UploadFile = File(...), password: str = Form(...)):
-    work_dir, input_path, safe_name = save_upload(file)
-    output_path = os.path.join(work_dir, f"protected_{safe_name}")
-
-    with open(input_path, "wb") as f:
-        f.write(await file.read())
-
-    try:
-        subprocess.run(["qpdf", "--encrypt", password, password, "256", "--", input_path, output_path], check=True, capture_output=True)
-        if not os.path.exists(output_path):
-            raise RuntimeError("Protected output file was not created")
-        return FileResponse(output_path, media_type="application/pdf", filename=f"protected_{safe_name}")
-    except subprocess.CalledProcessError as e:
-        return JSONResponse({"error": e.stderr.decode(errors="replace")}, status_code=500)
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
-
-
-@app.post("/unlock")
-async def unlock_pdf(file: UploadFile = File(...), password: str = Form(...)):
-    work_dir, input_path, safe_name = save_upload(file)
-    output_path = os.path.join(work_dir, f"unlocked_{safe_name}")
-
-    with open(input_path, "wb") as f:
-        f.write(await file.read())
-
-    try:
-        subprocess.run(["qpdf", "--decrypt", f"--password={password}", input_path, output_path], check=True, capture_output=True)
-        if not os.path.exists(output_path):
-            raise RuntimeError("Unlocked output file was not created")
-        return FileResponse(output_path, media_type="application/pdf", filename=f"unlocked_{safe_name}")
-    except subprocess.CalledProcessError:
-        return JSONResponse({"error": "كلمة المرور غير صحيحة أو الملف تالف"}, status_code=500)
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
-
-
-@app.post("/word-to-pdf")
-async def word_to_pdf(file: UploadFile = File(...)):
-    work_dir, input_path, safe_name = save_upload(file, prefix="")
-    with open(input_path, "wb") as f:
-        f.write(await file.read())
-
-    base_name = os.path.splitext(safe_name)[0]
-    output_path = os.path.join(work_dir, f"{base_name}.pdf")
-
-    try:
-        subprocess.run(["libreoffice", "--headless", "--convert-to", "pdf", "--outdir", work_dir, input_path], check=True, capture_output=True)
-        if not os.path.exists(output_path):
-            raise RuntimeError("LibreOffice did not create the PDF file")
-        return FileResponse(output_path, media_type="application/pdf", filename=f"{base_name}.pdf")
-    except subprocess.CalledProcessError as e:
-        return JSONResponse({"error": e.stderr.decode(errors="replace")}, status_code=500)
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
-
-
+# ================= PDF → WORD =================
 @app.post("/pdf-to-word")
 async def pdf_to_word(file: UploadFile = File(...)):
-    work_dir, input_path, safe_name = save_upload(file, prefix="")
+    work_dir, input_path, safe_name = save_upload(file)
+
     with open(input_path, "wb") as f:
         f.write(await file.read())
 
-    base_name = os.path.splitext(safe_name)[0]
-    output_path = os.path.join(work_dir, f"{base_name}.docx")
+    output_path = os.path.join(work_dir, "output.docx")
 
-    converter = None
     try:
         converter = Converter(input_path)
         converter.convert(output_path)
-        if not os.path.exists(output_path):
-            raise RuntimeError("DOCX output file was not created")
+        converter.close()
+
         return FileResponse(
             output_path,
             media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            filename=f"{base_name}.docx",
+            filename="converted.docx"
         )
+
     except Exception as e:
-        return JSONResponse({"error": f"PDF to Word conversion failed: {str(e)}"}, status_code=500)
-    finally:
-        if converter is not None:
-            try:
-                converter.close()
-            except Exception:
-                pass
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 
+# ================= PDF → IMAGE =================
 @app.post("/pdf-to-image")
-async def pdf_to_image(file: UploadFile = File(...), dpi: int = Form(150), fmt: str = Form("png")):
-    if fmt not in ["png", "jpg", "jpeg"]:
-        fmt = "png"
-    dpi = max(72, min(dpi, 300))
-
-    work_dir, input_path, _ = save_upload(file)
-    out_prefix = os.path.join(work_dir, "page")
-
-    with open(input_path, "wb") as f:
-        f.write(await file.read())
-
-    try:
-        ppm_fmt = "png" if fmt == "png" else "jpeg"
-        subprocess.run(["pdftoppm", f"-{ppm_fmt}", "-r", str(dpi), input_path, out_prefix], check=True, capture_output=True)
-
-        images = sorted([os.path.join(work_dir, fn) for fn in os.listdir(work_dir) if fn.startswith("page")])
-        if not images:
-            raise RuntimeError("No images were generated")
-
-        if len(images) == 1:
-            ext = "png" if fmt == "png" else "jpg"
-            return FileResponse(images[0], media_type=f"image/{ext}", filename=f"page-1.{ext}")
-
-        zip_path = os.path.join(work_dir, "pdf-pages.zip")
-        with zipfile.ZipFile(zip_path, "w") as zf:
-            for i, img_path in enumerate(images, 1):
-                ext = "png" if fmt == "png" else "jpg"
-                zf.write(img_path, f"page-{i}.{ext}")
-
-        return FileResponse(zip_path, media_type="application/zip", filename="pdf-pages.zip")
-    except subprocess.CalledProcessError as e:
-        return JSONResponse({"error": e.stderr.decode(errors="replace")}, status_code=500)
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
+async def pdf_to_image(file: UploadFile = File(...)):
+    return JSONResponse({"message": "Coming soon"})
 
 
+# ================= PDF → TEXT =================
 @app.post("/pdf-to-text")
-async def pdf_to_text(file: UploadFile = File(...), layout: bool = Form(False)):
-    work_dir, input_path, _ = save_upload(file)
-    output_path = os.path.join(work_dir, "output.txt")
-
-    with open(input_path, "wb") as f:
-        f.write(await file.read())
-
-    try:
-        cmd = ["pdftotext"]
-        if layout:
-            cmd.append("-layout")
-        cmd += [input_path, output_path]
-        subprocess.run(cmd, check=True, capture_output=True)
-
-        with open(output_path, "r", encoding="utf-8", errors="replace") as tf:
-            text = tf.read()
-
-        return JSONResponse({"text": text, "characters": len(text), "words": len(text.split())})
-    except subprocess.CalledProcessError as e:
-        return JSONResponse({"error": e.stderr.decode(errors="replace")}, status_code=500)
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
+async def pdf_to_text(file: UploadFile = File(...)):
+    return JSONResponse({"message": "Coming soon"})
 
 
-@app.post("/pdf-to-excel")
-async def pdf_to_excel(file: UploadFile = File(...)):
-    work_dir, input_path, safe_name = save_upload(file, prefix="")
-    base_name = os.path.splitext(safe_name)[0]
-    output_path = os.path.join(work_dir, f"{base_name}.xlsx")
-
-    with open(input_path, "wb") as f:
-        f.write(await file.read())
-
-    try:
-        # Step 1: رفع الملف على PDF.co
-        with open(input_path, "rb") as f:
-            upload_res = requests.post(
-                "https://api.pdf.co/v1/file/upload",
-                headers={"x-api-key": PDFCO_API_KEY},
-                files={"file": (safe_name, f, "application/pdf")}
-            )
-        upload_data = upload_res.json()
-        if not upload_data.get("url"):
-            raise RuntimeError("فشل رفع الملف على PDF.co")
-
-        uploaded_url = upload_data["url"]
-
-        # Step 2: طلب التحويل
-        convert_res = requests.post(
-            "https://api.pdf.co/v1/pdf/convert/to/xls",
-            headers={"x-api-key": PDFCO_API_KEY, "Content-Type": "application/json"},
-            json={
-                "url": uploaded_url,
-                "name": f"{base_name}.xlsx",
-                "async": True
-            }
-        )
-        convert_data = convert_res.json()
-        if convert_data.get("error"):
-            raise RuntimeError(convert_data.get("message", "فشل التحويل"))
-
-        job_id = convert_data.get("jobId")
-
-        # Step 3: انتظار النتيجة
-        for _ in range(30):
-            time.sleep(2)
-            check_res = requests.get(
-                f"https://api.pdf.co/v1/job/check?jobid={job_id}",
-                headers={"x-api-key": PDFCO_API_KEY}
-            )
-            check_data = check_res.json()
-            status = check_data.get("status")
-            if status == "success":
-                result_url = check_data.get("url")
-                break
-            elif status == "failed":
-                raise RuntimeError("فشل التحويل في PDF.co")
-        else:
-            raise RuntimeError("انتهت مهلة التحويل")
-
-        # Step 4: تحميل الملف
-        file_res = requests.get(result_url)
-        with open(output_path, "wb") as f:
-            f.write(file_res.content)
-
-        return FileResponse(
-            output_path,
-            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            filename=f"{base_name}.xlsx"
-        )
-
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
-
+# ================= START SERVER =================
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=8000)
