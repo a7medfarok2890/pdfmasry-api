@@ -1,4 +1,4 @@
 fastapi
 uvicorn
 python-multipart
-pdfservices-sdk
+pdfservices-sdk<4.0.0
