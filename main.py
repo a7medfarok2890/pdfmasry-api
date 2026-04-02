@@ -13,7 +13,7 @@ import logging
 # =============================================
 #  CONFIGURATION
 # =============================================
-API_KEY = os.getenv("PDFCO_API_KEY", "a7medfarok36@gmail.com_bqZ97bA0fgA0Xgu8coymanXASyNoL0JGKvSV9wI3NjKWQr5OFJvpV54rNZn8D5Qv")
+API_KEY = os.getenv("PDFCO_API_KEY", "a7medfarok36@gmail.com_MvEXnMN6HVzzWK4SdBjuTnCQdjL8rLmFaDEo3dbK1lEWB9foPJu07JgGhhoU6ujx")
 PDFCO_BASE = "https://api.pdf.co/v1"
 UPLOAD_DIR = tempfile.mkdtemp(prefix="pdfmasry_")
 FILE_TTL   = 3600          # حذف الملفات بعد ساعة
@@ -152,9 +152,13 @@ async def pdfco_job(endpoint: str, payload: dict) -> dict:
 
 
 async def pdfco_download(url: str, out_path: str):
-    """تحميل الملف الناتج من pdf.co"""
+    """تحميل الملف الناتج من pdf.co — S3 URLs لا تحتاج API key"""
     async with httpx.AsyncClient(timeout=120, follow_redirects=True) as client:
-        r = await client.get(url, headers={"x-api-key": API_KEY})
+        # S3 presigned URLs ترفض الـ headers الإضافية — نرسل بدون API key
+        if "s3" in url or "amazonaws" in url or "X-Amz" in url:
+            r = await client.get(url)
+        else:
+            r = await client.get(url, headers={"x-api-key": API_KEY})
         r.raise_for_status()
         with open(out_path, "wb") as f:
             f.write(r.content)
