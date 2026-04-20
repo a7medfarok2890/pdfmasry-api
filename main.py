@@ -20,10 +20,13 @@ app = FastAPI(title="PDFMasry API Complete", version="4.0")
 # إعدادات الأمان (CORS) لحماية الباندويث الخاص بك
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://pdfmasry.com", 
-        "https://www.pdfmasry.com", 
-        "https://taupe-rugelach-921837.netlify.app"
+          allow_origins=[
+        "https://pdfmasry.com",
+        "https://www.pdfmasry.com",
+        "https://taupe-rugelach-921837.netlify.app",
+        "https://pdfmasry-staging.netlify.app",
+        "http://localhost:4321",
+        "http://localhost:4322"
     ],
     allow_credentials=True,
     allow_methods=["*"],
