@@ -1,9 +1,20 @@
-"""PDFMasry API — secure edition (patched 2026-07-30).
+"""PDFMasry API — secure edition (patched 2026-08-03).
 
-Fixes CRITICAL vulnerability where downloads were addressed by the original
-filename, letting anyone with a guessable name pull another user's file.
+Adds three Day-1-audit fixes on top of the 2026-07-30 UUID+HMAC baseline:
 
-Every convert endpoint now:
+  1. MIME magic-byte validation before running any subprocess.
+     Wrong file type now returns 415 (or 400 for empty/corrupt) instead
+     of leaking 500 from the underlying tool.
+
+  2. Per-IP rate limiting via slowapi.
+     Convert endpoints: 20/minute. Downloads: 60/minute.
+     Global default: 120/hour.
+
+  3. HEAD method on /api/download/{job_id}/{token}.
+     Same headers as GET, no body. Fixes crawler / link-preview probes
+     that previously got 405.
+
+Every convert endpoint still:
   * stores files in <uploads>/<job_uuid>/  (per-job isolation)
   * returns a signed one-time download URL: /api/download/<job_id>/<token>
   * token = HMAC(secret, "<job_id>.<expiry>") with 1h TTL
@@ -11,9 +22,10 @@ Every convert endpoint now:
   * emits Cache-Control: private, no-store on downloads
   * deletes the whole job dir after 1 hour via background task
 
-Endpoints kept identical to the frontend's calls:
+Endpoints unchanged from the frontend's perspective:
   POST /api/{tool}     → 200 {"status":"success","download_url":"/api/download/..."}
   GET  /api/download/{job_id}/{token}   → file with proper headers
+  HEAD /api/download/{job_id}/{token}   → same headers, no body
 """
 from __future__ import annotations
 
@@ -36,10 +48,15 @@ from fastapi import (
     File,
     Form,
     HTTPException,
+    Request,
+    Response,
     UploadFile,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
 
 # --- استدعاء مكتبات أدوبي الحديثة (V4) ---
 from adobe.pdfservices.operation.auth.service_principal_credentials import ServicePrincipalCredentials
@@ -50,7 +67,14 @@ from adobe.pdfservices.operation.pdfjobs.params.export_pdf.export_pdf_params imp
 from adobe.pdfservices.operation.pdfjobs.params.export_pdf.export_pdf_target_format import ExportPDFTargetFormat
 from adobe.pdfservices.operation.pdfjobs.result.export_pdf_result import ExportPDFResult
 
-app = FastAPI(title="PDFMasry API Complete", version="5.0-secure")
+# ───────────────────────────────────────────────────────────────────────
+# Rate limiter — per-IP quotas via X-Forwarded-For (Railway sets this)
+# ───────────────────────────────────────────────────────────────────────
+limiter = Limiter(key_func=get_remote_address, default_limits=["120/hour", "60/minute"])
+
+app = FastAPI(title="PDFMasry API Complete", version="5.1-secure")
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # إعدادات الأمان (CORS) لحماية الباندويث الخاص بك
 app.add_middleware(
@@ -78,10 +102,63 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 DOWNLOAD_SECRET = os.environ.get("DOWNLOAD_SECRET") or secrets.token_urlsafe(32)
 DOWNLOAD_TOKEN_TTL_SECONDS = 60 * 60  # 1 hour
 JOB_TTL_SECONDS = 60 * 60             # cleanup after 1 hour
+MAX_UPLOAD_BYTES = 50 * 1024 * 1024   # 50 MB — matches frontend claim
 
-# ---------------------------------------------------------
+# ───────────────────────────────────────────────────────────────────────
+# MIME validation — magic bytes only, no reliance on filename extension
+# ───────────────────────────────────────────────────────────────────────
+# Accepted magic byte signatures per tool family.
+MAGIC_PDF = b"%PDF-"
+MAGIC_ZIP = b"PK\x03\x04"          # DOCX, XLSX, PPTX (Office 2007+)
+MAGIC_OLE = b"\xd0\xcf\x11\xe0"    # DOC, XLS, PPT (Office 97-2003)
+
+
+def _detect_magic(path: str) -> str:
+    """Return a canonical family name based on the first few bytes,
+    or empty string if unrecognised. We only need to distinguish the
+    types this API accepts.
+    """
+    try:
+        with open(path, "rb") as f:
+            head = f.read(8)
+    except (OSError, IOError):
+        return ""
+    if head.startswith(MAGIC_PDF):
+        return "pdf"
+    if head.startswith(MAGIC_ZIP):
+        return "office_zip"     # docx/xlsx/pptx — distinguish later per endpoint
+    if head.startswith(MAGIC_OLE):
+        return "office_ole"     # doc/xls/ppt legacy
+    return ""
+
+
+def _validate_input(path: str, allowed_families: set[str]) -> None:
+    """Raise HTTPException if the file at `path` isn't in `allowed_families`.
+    Files that don't match any known magic → 415.
+    Empty files → 400.
+    """
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        size = 0
+    if size == 0:
+        raise HTTPException(status_code=400, detail="الملف فارغ")
+    family = _detect_magic(path)
+    if not family:
+        raise HTTPException(
+            status_code=415,
+            detail="نوع الملف غير مدعوم — تأكد إن الملف حقيقي وسليم",
+        )
+    if family not in allowed_families:
+        raise HTTPException(
+            status_code=415,
+            detail="نوع الملف لا يتوافق مع هذه الأداة",
+        )
+
+
+# ───────────────────────────────────────────────────────────────────────
 # Security helpers — UUID job dirs, signed tokens, sanitized names
-# ---------------------------------------------------------
+# ───────────────────────────────────────────────────────────────────────
 
 def _new_job_id() -> str:
     """32 hex chars, 128 bits of entropy — unguessable."""
@@ -134,16 +211,43 @@ def _content_disposition(download_name: str) -> str:
     return f'attachment; filename="{ascii_fallback}"; filename*=UTF-8\'\'{quoted}'
 
 
-async def _save_upload_to_job(file: UploadFile) -> tuple[str, str, str]:
-    """Create a fresh job dir, save the upload inside it as input.bin.
-    Returns (job_id, job_dir, sanitized_original_name).
+async def _save_upload_to_job(file: UploadFile, allowed_families: set[str]) -> tuple[str, str, str]:
+    """Create a fresh job dir, save upload as input.bin, validate its magic
+    bytes against `allowed_families`. On rejection the job dir is cleaned
+    up and an HTTPException is raised.
+
+    Returns (job_id, job_dir, sanitized_original_name) on success.
     """
     job_id = _new_job_id()
     jdir = _job_dir(job_id)
     os.makedirs(jdir, exist_ok=True)
     input_path = os.path.join(jdir, "input.bin")
-    with open(input_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
+    total = 0
+    try:
+        with open(input_path, "wb") as buffer:
+            # Stream in chunks so we can enforce size cap without loading
+            # the whole file into memory.
+            while True:
+                chunk = await file.read(1024 * 1024)  # 1 MB
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > MAX_UPLOAD_BYTES:
+                    buffer.close()
+                    shutil.rmtree(jdir, ignore_errors=True)
+                    raise HTTPException(
+                        status_code=413,
+                        detail="حجم الملف يتجاوز الحد المسموح (50 ميجابايت)",
+                    )
+                buffer.write(chunk)
+        _validate_input(input_path, allowed_families)
+    except HTTPException:
+        shutil.rmtree(jdir, ignore_errors=True)
+        raise
+    except Exception as e:
+        shutil.rmtree(jdir, ignore_errors=True)
+        raise HTTPException(status_code=500, detail=f"فشل استقبال الملف: {str(e)}")
+
     return job_id, jdir, _sanitize_filename(file.filename or "file")
 
 
@@ -170,9 +274,9 @@ async def _delete_job_after_delay(job_id: str, delay_seconds: int = JOB_TTL_SECO
     if os.path.exists(jdir):
         shutil.rmtree(jdir, ignore_errors=True)
 
-# ---------------------------------------------------------
+# ───────────────────────────────────────────────────────────────────────
 # 1. المحرك الأساسي لأدوبي (Adobe V4) للتحويل العربي الدقيق
-# ---------------------------------------------------------
+# ───────────────────────────────────────────────────────────────────────
 def process_pdf_adobe_v4(input_path: str, output_path: str, target_format):
     client_id = os.getenv("ADOBE_CLIENT_ID")
     client_secret = os.getenv("ADOBE_CLIENT_SECRET")
@@ -199,9 +303,9 @@ def process_pdf_adobe_v4(input_path: str, output_path: str, target_format):
     with open(output_path, "wb") as output_file:
         output_file.write(stream_asset.get_input_stream())
 
-# ---------------------------------------------------------
-# 2. Health + secure download
-# ---------------------------------------------------------
+# ───────────────────────────────────────────────────────────────────────
+# 2. Health + secure download (GET + HEAD)
+# ───────────────────────────────────────────────────────────────────────
 @app.get("/")
 def health_check():
     return {"status": "PDFMasry API is running with ALL Server Tools!", "version": app.version}
@@ -212,39 +316,78 @@ def health():
     return {"status": "ok"}
 
 
-@app.get("/api/download/{job_id}/{token}")
-def download_file(job_id: str, token: str):
-    # Only accept hex uuid.hex form to prevent path traversal via job_id
+def _build_download_headers(job_id: str, token: str) -> tuple[dict, str, str, str] | JSONResponse:
+    """Shared validation + header prep for both GET and HEAD download.
+    Returns (headers, media_type, download_name, output_path) on success,
+    or a JSONResponse to send directly on error.
+    """
     if not re.fullmatch(r"[a-f0-9]{32}", job_id):
-        raise HTTPException(status_code=404, detail="Not found")
+        return JSONResponse({"detail": "Not found"}, status_code=404)
     if not _verify_token(job_id, token):
-        raise HTTPException(status_code=403, detail="Invalid or expired link")
+        return JSONResponse({"detail": "Invalid or expired link"}, status_code=403)
 
     jdir = _job_dir(job_id)
     output = os.path.join(jdir, "output.bin")
     meta_path = os.path.join(jdir, "meta.txt")
     if not os.path.isfile(output) or not os.path.isfile(meta_path):
-        raise HTTPException(status_code=404, detail="File not found or already deleted")
+        return JSONResponse({"detail": "File not found or already deleted"}, status_code=404)
 
     with open(meta_path, "r", encoding="utf-8") as f:
         lines = f.read().splitlines()
     media_type = lines[0] if lines else "application/octet-stream"
     download_name = lines[1] if len(lines) > 1 else "download"
 
+    headers = {
+        "Content-Disposition": _content_disposition(download_name),
+        "Cache-Control": "private, no-store",
+        "Pragma": "no-cache",
+        "X-Content-Type-Options": "nosniff",
+        "Referrer-Policy": "no-referrer",
+    }
+    return headers, media_type, download_name, output
+
+
+@app.get("/api/download/{job_id}/{token}")
+@limiter.limit("60/minute")
+def download_file(job_id: str, token: str, request: Request):
+    result = _build_download_headers(job_id, token)
+    if isinstance(result, JSONResponse):
+        return result
+    headers, media_type, _download_name, output = result
     response = FileResponse(output, media_type=media_type)
-    response.headers["Content-Disposition"] = _content_disposition(download_name)
-    response.headers["Cache-Control"] = "private, no-store"
-    response.headers["Pragma"] = "no-cache"
-    response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["Referrer-Policy"] = "no-referrer"
+    for k, v in headers.items():
+        response.headers[k] = v
     return response
 
-# ---------------------------------------------------------
-# 3. مسارات أدوبي (للغة العربية)
-# ---------------------------------------------------------
+
+@app.head("/api/download/{job_id}/{token}")
+@limiter.limit("60/minute")
+def head_download_file(job_id: str, token: str, request: Request):
+    """HEAD variant: same headers as GET, no body.
+    Some clients (link previewers, crawlers, download managers) probe with
+    HEAD before GET. Without this handler they got 405 Method Not Allowed.
+    """
+    result = _build_download_headers(job_id, token)
+    if isinstance(result, JSONResponse):
+        return result
+    headers, media_type, _download_name, output = result
+    # Report actual file size so range requests and progress bars work.
+    try:
+        size = os.path.getsize(output)
+    except OSError:
+        size = 0
+    headers["Content-Length"] = str(size)
+    headers["Content-Type"] = media_type
+    return Response(status_code=200, headers=headers)
+
+
+# ───────────────────────────────────────────────────────────────────────
+# 3. مسارات أدوبي (للغة العربية) — accept PDF only
+# ───────────────────────────────────────────────────────────────────────
 @app.post("/api/pdf-to-word")
-async def convert_pdf_to_word(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
-    job_id, jdir, orig = await _save_upload_to_job(file)
+@limiter.limit("20/minute")
+async def convert_pdf_to_word(request: Request, background_tasks: BackgroundTasks, file: UploadFile = File(...)):
+    job_id, jdir, orig = await _save_upload_to_job(file, {"pdf"})
     input_path = os.path.join(jdir, "input.bin")
     output_path = os.path.join(jdir, "converted.docx")
     try:
@@ -264,8 +407,9 @@ async def convert_pdf_to_word(background_tasks: BackgroundTasks, file: UploadFil
 
 
 @app.post("/api/pdf-to-excel")
-async def convert_pdf_to_excel(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
-    job_id, jdir, orig = await _save_upload_to_job(file)
+@limiter.limit("20/minute")
+async def convert_pdf_to_excel(request: Request, background_tasks: BackgroundTasks, file: UploadFile = File(...)):
+    job_id, jdir, orig = await _save_upload_to_job(file, {"pdf"})
     input_path = os.path.join(jdir, "input.bin")
     output_path = os.path.join(jdir, "converted.xlsx")
     try:
@@ -283,12 +427,13 @@ async def convert_pdf_to_excel(background_tasks: BackgroundTasks, file: UploadFi
         background_tasks.add_task(_delete_job_after_delay, job_id, delay_seconds=5)
         raise HTTPException(status_code=500, detail=f"حدث خطأ: {str(e)}")
 
-# ---------------------------------------------------------
-# 4. مسارات الأدوات المجانية (Ghostscript, qpdf, LibreOffice, Poppler)
-# ---------------------------------------------------------
+# ───────────────────────────────────────────────────────────────────────
+# 4. الأدوات المجانية (Ghostscript, qpdf, LibreOffice, Poppler) — PDF
+# ───────────────────────────────────────────────────────────────────────
 @app.post("/api/compress")
-async def compress_pdf(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
-    job_id, jdir, orig = await _save_upload_to_job(file)
+@limiter.limit("20/minute")
+async def compress_pdf(request: Request, background_tasks: BackgroundTasks, file: UploadFile = File(...)):
+    job_id, jdir, orig = await _save_upload_to_job(file, {"pdf"})
     input_path = os.path.join(jdir, "input.bin")
     output_path = os.path.join(jdir, "compressed.pdf")
     try:
@@ -305,8 +450,14 @@ async def compress_pdf(background_tasks: BackgroundTasks, file: UploadFile = Fil
 
 
 @app.post("/api/protect")
-async def protect_pdf(background_tasks: BackgroundTasks, file: UploadFile = File(...), password: str = Form("pdfmasry")):
-    job_id, jdir, orig = await _save_upload_to_job(file)
+@limiter.limit("15/minute")
+async def protect_pdf(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    password: str = Form("pdfmasry"),
+):
+    job_id, jdir, orig = await _save_upload_to_job(file, {"pdf"})
     input_path = os.path.join(jdir, "input.bin")
     output_path = os.path.join(jdir, "protected.pdf")
     try:
@@ -321,8 +472,14 @@ async def protect_pdf(background_tasks: BackgroundTasks, file: UploadFile = File
 
 
 @app.post("/api/unlock")
-async def unlock_pdf(background_tasks: BackgroundTasks, file: UploadFile = File(...), password: str = Form("pdfmasry")):
-    job_id, jdir, orig = await _save_upload_to_job(file)
+@limiter.limit("15/minute")
+async def unlock_pdf(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    password: str = Form("pdfmasry"),
+):
+    job_id, jdir, orig = await _save_upload_to_job(file, {"pdf"})
     input_path = os.path.join(jdir, "input.bin")
     output_path = os.path.join(jdir, "unlocked.pdf")
     try:
@@ -337,8 +494,9 @@ async def unlock_pdf(background_tasks: BackgroundTasks, file: UploadFile = File(
 
 
 @app.post("/api/pdf-to-image")
-async def pdf_to_image(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
-    job_id, jdir, orig = await _save_upload_to_job(file)
+@limiter.limit("20/minute")
+async def pdf_to_image(request: Request, background_tasks: BackgroundTasks, file: UploadFile = File(...)):
+    job_id, jdir, orig = await _save_upload_to_job(file, {"pdf"})
     input_path = os.path.join(jdir, "input.bin")
     pages_dir = os.path.join(jdir, "pages")
     os.makedirs(pages_dir, exist_ok=True)
@@ -361,8 +519,10 @@ async def pdf_to_image(background_tasks: BackgroundTasks, file: UploadFile = Fil
 
 @app.post("/api/word-to-pdf")
 @app.post("/api/excel-to-pdf")
-async def office_to_pdf(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
-    job_id, jdir, orig = await _save_upload_to_job(file)
+@limiter.limit("20/minute")
+async def office_to_pdf(request: Request, background_tasks: BackgroundTasks, file: UploadFile = File(...)):
+    # Accept both Office 2007+ (zip) and legacy 97-2003 (ole).
+    job_id, jdir, orig = await _save_upload_to_job(file, {"office_zip", "office_ole"})
     # LibreOffice needs the input to have a proper extension
     input_ext = os.path.splitext(orig)[1] or ".docx"
     input_path = os.path.join(jdir, f"input{input_ext}")
