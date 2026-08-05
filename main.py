@@ -68,6 +68,33 @@ from adobe.pdfservices.operation.pdfjobs.params.export_pdf.export_pdf_target_for
 from adobe.pdfservices.operation.pdfjobs.result.export_pdf_result import ExportPDFResult
 
 # ───────────────────────────────────────────────────────────────────────
+# Result cache + usage tracking (Phase 1 of arch redesign, 2026-08-05)
+# ───────────────────────────────────────────────────────────────────────
+# Design goal: skip Adobe transactions when the same file was already
+# converted recently. Also tracks Adobe usage per endpoint so the admin
+# dashboard can show remaining monthly quota.
+#
+# Feature flag CACHE_ENABLED controls whether cache lookups happen — set
+# to "false" (default) means the wrapper functions bypass entirely and
+# behavior is identical to the pre-cache codebase. Rollback = env var.
+import cache as pdf_cache
+import cache_stats
+
+CACHE_ENABLED = os.environ.get("CACHE_ENABLED", "false").lower() == "true"
+
+# Bump this on Adobe SDK upgrades or format-changing config changes so
+# stored cache entries invalidate automatically. Format: freeform tag.
+ADOBE_PROVIDER_VERSION = "adobe-sdk-v4-2026-08"
+
+# Monthly Adobe free tier — surfaced by /api/admin/cache-stats so the
+# dashboard can compute remaining quota. Bump if the paid tier is purchased.
+ADOBE_MONTHLY_QUOTA = int(os.environ.get("ADOBE_MONTHLY_QUOTA", "500"))
+
+# Admin token gates /api/admin/cache-stats. Missing token → endpoint 401s
+# for everyone (fail closed, don't accidentally expose usage counters).
+ADMIN_STATS_TOKEN = os.environ.get("ADMIN_STATS_TOKEN")
+
+# ───────────────────────────────────────────────────────────────────────
 # Rate limiter — per-IP quotas via X-Forwarded-For (Railway sets this)
 # ───────────────────────────────────────────────────────────────────────
 limiter = Limiter(key_func=get_remote_address, default_limits=["120/hour", "60/minute"])
@@ -316,6 +343,34 @@ def health():
     return {"status": "ok"}
 
 
+# ───────────────────────────────────────────────────────────────────────
+# Admin: cache + Adobe usage stats
+# ───────────────────────────────────────────────────────────────────────
+# Behind a shared secret env var. No user data, no filenames — just
+# counters. Fail closed: if ADMIN_STATS_TOKEN is unset, endpoint 401s
+# for everyone.
+
+@app.get("/api/admin/cache-stats")
+def admin_cache_stats(request: Request):
+    """Returns cache hit rates + Adobe monthly usage. Requires admin token
+    passed either as ``?token=`` query param or ``X-Admin-Token`` header.
+
+    Response shape is documented in cache_stats.snapshot(). Safe to poll
+    from a dashboard; O(1) work regardless of cache size.
+    """
+    if not ADMIN_STATS_TOKEN:
+        raise HTTPException(status_code=401, detail="Admin stats endpoint not configured")
+    supplied = request.query_params.get("token") or request.headers.get("X-Admin-Token", "")
+    if not hmac.compare_digest(supplied, ADMIN_STATS_TOKEN):
+        raise HTTPException(status_code=401, detail="Invalid admin token")
+    return {
+        "cache_enabled": CACHE_ENABLED,
+        "adobe_provider_version": ADOBE_PROVIDER_VERSION,
+        "counters": cache_stats.snapshot(monthly_quota=ADOBE_MONTHLY_QUOTA),
+        "cache_health": pdf_cache.stats(),
+    }
+
+
 def _build_download_headers(job_id: str, token: str) -> tuple[dict, str, str, str] | JSONResponse:
     """Shared validation + header prep for both GET and HEAD download.
     Returns (headers, media_type, download_name, output_path) on success,
@@ -384,6 +439,79 @@ def head_download_file(job_id: str, token: str, request: Request):
 # ───────────────────────────────────────────────────────────────────────
 # 3. مسارات أدوبي (للغة العربية) — accept PDF only
 # ───────────────────────────────────────────────────────────────────────
+# Cache flow (only when CACHE_ENABLED=true):
+#   1. Hash the input file bytes (SHA-256).
+#   2. Build a CacheKey (input hash + target format + provider version).
+#   3. If a fresh cached output exists → copy it into the job dir and
+#      return the same signed download URL the caller expects. Adobe is
+#      NOT called. record_cache_hit() is called; Adobe counter not touched.
+#   4. If cache miss → call Adobe as before, record_adobe_transaction(),
+#      then put the result into cache for future hits.
+#
+# Design intent: no observable behavior change for the caller. Same URL
+# shape, same headers, same download name. The only sign a hit happened
+# is faster response time and the admin stats endpoint incrementing.
+
+def _cached_or_adobe_convert(
+    endpoint: str,
+    input_path: str,
+    output_path: str,
+    target_format,
+) -> bool:
+    """Run Adobe conversion with a cache in front.
+
+    Args:
+        endpoint: tool name for Adobe counter attribution ("pdf-to-word", ...)
+        input_path: user-uploaded PDF
+        output_path: where the DOCX/XLSX result must end up
+        target_format: Adobe ExportPDFTargetFormat enum member
+
+    Returns:
+        True if served from cache (Adobe skipped), False if Adobe ran.
+
+    Safety net: if the cache module raises for any reason, we fall back to
+    running Adobe directly — never let a cache bug break the tool.
+    """
+    if not CACHE_ENABLED:
+        process_pdf_adobe_v4(input_path, output_path, target_format)
+        cache_stats.record_adobe_transaction(endpoint)
+        return False
+
+    try:
+        target_str = str(target_format).split(".")[-1].lower()  # "docx" or "xlsx"
+        key = pdf_cache.CacheKey(
+            input_sha256=pdf_cache.hash_file(input_path),
+            target_format=target_str,
+            provider_name="adobe",
+            provider_version=ADOBE_PROVIDER_VERSION,
+            password_hash="",  # these two Adobe endpoints don't take passwords
+        )
+        cached_path = pdf_cache.get(key)
+        if cached_path is not None:
+            shutil.copyfile(cached_path, output_path)
+            cache_stats.record_cache_hit()
+            return True
+
+        cache_stats.record_cache_miss()
+    except Exception:
+        # Cache lookup failed — fall through to normal Adobe path, don't
+        # break the user's request. Miss/hit counters may be inaccurate
+        # for this call; acceptable trade-off.
+        cached_path = None
+
+    # Cache miss path: run Adobe as before
+    process_pdf_adobe_v4(input_path, output_path, target_format)
+    cache_stats.record_adobe_transaction(endpoint)
+
+    # Populate cache for next time — failures here shouldn't affect the user.
+    if CACHE_ENABLED:
+        try:
+            pdf_cache.put(key, output_path)
+        except Exception:
+            pass
+    return False
+
+
 @app.post("/api/pdf-to-word")
 @limiter.limit("20/minute")
 async def convert_pdf_to_word(request: Request, background_tasks: BackgroundTasks, file: UploadFile = File(...)):
@@ -391,7 +519,7 @@ async def convert_pdf_to_word(request: Request, background_tasks: BackgroundTask
     input_path = os.path.join(jdir, "input.bin")
     output_path = os.path.join(jdir, "converted.docx")
     try:
-        process_pdf_adobe_v4(input_path, output_path, ExportPDFTargetFormat.DOCX)
+        _cached_or_adobe_convert("pdf-to-word", input_path, output_path, ExportPDFTargetFormat.DOCX)
         base = os.path.splitext(orig)[0] or "document"
         response_data = _make_response(
             job_id,
@@ -413,7 +541,7 @@ async def convert_pdf_to_excel(request: Request, background_tasks: BackgroundTas
     input_path = os.path.join(jdir, "input.bin")
     output_path = os.path.join(jdir, "converted.xlsx")
     try:
-        process_pdf_adobe_v4(input_path, output_path, ExportPDFTargetFormat.XLSX)
+        _cached_or_adobe_convert("pdf-to-excel", input_path, output_path, ExportPDFTargetFormat.XLSX)
         base = os.path.splitext(orig)[0] or "document"
         response_data = _make_response(
             job_id,
