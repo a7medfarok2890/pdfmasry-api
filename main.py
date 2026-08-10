@@ -457,53 +457,100 @@ USE_ADOBE = os.environ.get("USE_ADOBE", "false").lower() == "true"
 LIBREOFFICE_PROVIDER_VERSION = "libreoffice-cli-2026-08"
 
 
-def process_pdf_libreoffice(input_path: str, output_path: str, target_ext: str) -> None:
-    """PDF → DOCX/XLSX via LibreOffice headless CLI.
+def process_pdf_to_docx(input_path: str, output_path: str) -> None:
+    """PDF → DOCX via pdf2docx (pymupdf-backed).
 
-    Args:
-        input_path: uploaded PDF (must exist)
-        output_path: canonical destination for the produced Office file
-        target_ext: "docx" or "xlsx"
+    Chosen over LibreOffice for two reasons:
+      1. LibreOffice imports PDFs as Draw docs, so --convert-to docx just
+         drops the content and produces an empty Writer file.
+      2. pdf2docx preserves text runs, tables, images, and — critically for
+         us — RTL text direction on Arabic content.
 
-    Raises:
-        HTTPException 500 with a user-friendly message on failure. Timeout
-        is 90s; longer than typical (5-15s) but tight enough that a stuck
-        subprocess doesn't hold a worker forever.
+    Raises HTTPException 500 with a friendly Arabic message on failure.
     """
-    if target_ext not in {"docx", "xlsx"}:
-        raise HTTPException(status_code=500, detail=f"صيغة غير مدعومة: {target_ext}")
-
-    outdir = os.path.dirname(output_path) or "."
     try:
-        subprocess.run(
-            [
-                "libreoffice", "--headless",
-                "--convert-to", target_ext,
-                "--outdir", outdir,
-                input_path,
-            ],
-            check=True,
-            capture_output=True,
-            timeout=90,
-        )
-    except subprocess.TimeoutExpired:
-        raise HTTPException(status_code=504, detail="انتهت مهلة تحويل الملف — جرّب ملف أصغر")
-    except subprocess.CalledProcessError as e:
-        stderr_snippet = (e.stderr or b"").decode("utf-8", "ignore")[:200]
+        # Lazy import so a broken install of pdf2docx doesn't crash boot.
+        from pdf2docx import Converter
+    except ImportError:
+        raise HTTPException(status_code=500, detail="مكتبة التحويل غير مثبتة على الخادم")
+
+    try:
+        cv = Converter(input_path)
+        try:
+            cv.convert(output_path)
+        finally:
+            cv.close()
+    except Exception as e:
         raise HTTPException(
             status_code=500,
-            detail=f"تعذّر تحويل الملف. ربما الملف تالف أو يستخدم تنسيقاً معقداً. تفاصيل: {stderr_snippet}",
+            detail=f"تعذّر تحويل الملف إلى Word — ربما الملف تالف أو مشفَّر. ({str(e)[:150]})",
         )
 
-    # LibreOffice writes <input_basename>.<target_ext> into outdir; move
-    # it to our canonical path so downstream code doesn't need to know
-    # about that convention.
-    input_base = os.path.splitext(os.path.basename(input_path))[0]
-    default_out = os.path.join(outdir, f"{input_base}.{target_ext}")
-    if not os.path.exists(default_out):
-        raise HTTPException(status_code=500, detail="فشل التحويل: لم يُنشأ ملف الإخراج")
-    if os.path.abspath(default_out) != os.path.abspath(output_path):
-        shutil.move(default_out, output_path)
+    if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
+        raise HTTPException(status_code=500, detail="فشل التحويل: لم يُنشأ ملف Word صالح")
+
+
+def process_pdf_to_xlsx(input_path: str, output_path: str) -> None:
+    """PDF → XLSX via pdfplumber (table extraction) + openpyxl (writer).
+
+    Each PDF page becomes its own sheet. Tables detected by pdfplumber are
+    written as-is; if a page has no detectable tables, its extracted text
+    is written as a single-column fallback so the user still gets content
+    instead of a blank sheet.
+
+    Preserves Arabic text (pdfplumber returns Unicode). No RTL formatting
+    is applied at the cell level — Excel handles that from the character
+    direction bit.
+    """
+    try:
+        import pdfplumber
+        from openpyxl import Workbook
+    except ImportError:
+        raise HTTPException(status_code=500, detail="مكتبة التحويل غير مثبتة على الخادم")
+
+    try:
+        wb = Workbook()
+        # Remove default sheet — we'll add one per page
+        default_sheet = wb.active
+        wb.remove(default_sheet)
+
+        with pdfplumber.open(input_path) as pdf:
+            if not pdf.pages:
+                raise HTTPException(status_code=500, detail="الملف لا يحتوي على صفحات")
+
+            for page_num, page in enumerate(pdf.pages, start=1):
+                sheet_name = f"Page {page_num}"[:31]  # Excel sheet name limit
+                ws = wb.create_sheet(title=sheet_name)
+                tables = page.extract_tables() or []
+                if tables:
+                    for table in tables:
+                        for row in table:
+                            # openpyxl expects a list; None cells become empty
+                            ws.append([cell if cell is not None else "" for cell in row])
+                        ws.append([])  # blank row between tables
+                else:
+                    # No tables detected — fall back to line-by-line text so
+                    # the user isn't left with an empty sheet.
+                    text = page.extract_text() or ""
+                    for line in text.splitlines():
+                        if line.strip():
+                            ws.append([line])
+
+        # Guard against a completely empty workbook (all pages truly blank)
+        if not wb.sheetnames:
+            wb.create_sheet(title="Empty")
+
+        wb.save(output_path)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"تعذّر تحويل الملف إلى Excel. ({str(e)[:150]})",
+        )
+
+    if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
+        raise HTTPException(status_code=500, detail="فشل التحويل: لم يُنشأ ملف Excel صالح")
 
 
 def _convert_pdf_to_office(
@@ -559,8 +606,12 @@ def _convert_pdf_to_office(
     if USE_ADOBE:
         process_pdf_adobe_v4(input_path, output_path, adobe_format)
         cache_stats.record_adobe_transaction(endpoint)
+    elif target_ext == "docx":
+        process_pdf_to_docx(input_path, output_path)
+    elif target_ext == "xlsx":
+        process_pdf_to_xlsx(input_path, output_path)
     else:
-        process_pdf_libreoffice(input_path, output_path, target_ext)
+        raise HTTPException(status_code=500, detail=f"صيغة إخراج غير مدعومة: {target_ext}")
 
     # Populate cache for next time — never let a cache write failure break
     # a successful conversion.

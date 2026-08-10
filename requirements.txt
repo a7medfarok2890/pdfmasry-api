@@ -3,3 +3,6 @@ uvicorn
 python-multipart
 pdfservices-sdk
 slowapi
+pdf2docx
+pdfplumber
+openpyxl
