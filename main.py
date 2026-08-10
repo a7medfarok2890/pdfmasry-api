@@ -437,74 +437,134 @@ def head_download_file(job_id: str, token: str, request: Request):
 
 
 # ───────────────────────────────────────────────────────────────────────
-# 3. مسارات أدوبي (للغة العربية) — accept PDF only
+# 3. مسارات تحويل PDF → Office (اللغة العربية) — accept PDF only
 # ───────────────────────────────────────────────────────────────────────
-# Cache flow (only when CACHE_ENABLED=true):
-#   1. Hash the input file bytes (SHA-256).
-#   2. Build a CacheKey (input hash + target format + provider version).
-#   3. If a fresh cached output exists → copy it into the job dir and
-#      return the same signed download URL the caller expects. Adobe is
-#      NOT called. record_cache_hit() is called; Adobe counter not touched.
-#   4. If cache miss → call Adobe as before, record_adobe_transaction(),
-#      then put the result into cache for future hits.
+# Provider routing (2026-08 emergency fix):
+#   Adobe PDF Services' free monthly quota (500 tx) got exhausted in
+#   production, so every user request was returning 500 from the SDK.
+#   We now route through LibreOffice by default — self-hosted, unlimited,
+#   already on the Railway image (used for Word→PDF the other direction).
+#   Adobe path is kept as an opt-in via USE_ADOBE=true env var for the
+#   day the paid tier is turned on; the cache layer still fronts either
+#   provider transparently.
 #
-# Design intent: no observable behavior change for the caller. Same URL
-# shape, same headers, same download name. The only sign a hit happened
-# is faster response time and the admin stats endpoint incrementing.
+# Quality note: LibreOffice's PDF→Office conversion is generally
+# reasonable but weaker than Adobe on complex layouts (multi-column,
+# heavy embedded fonts). For our Arabic user base, the RTL text is
+# preserved correctly which is the main constraint.
 
-def _cached_or_adobe_convert(
+USE_ADOBE = os.environ.get("USE_ADOBE", "false").lower() == "true"
+LIBREOFFICE_PROVIDER_VERSION = "libreoffice-cli-2026-08"
+
+
+def process_pdf_libreoffice(input_path: str, output_path: str, target_ext: str) -> None:
+    """PDF → DOCX/XLSX via LibreOffice headless CLI.
+
+    Args:
+        input_path: uploaded PDF (must exist)
+        output_path: canonical destination for the produced Office file
+        target_ext: "docx" or "xlsx"
+
+    Raises:
+        HTTPException 500 with a user-friendly message on failure. Timeout
+        is 90s; longer than typical (5-15s) but tight enough that a stuck
+        subprocess doesn't hold a worker forever.
+    """
+    if target_ext not in {"docx", "xlsx"}:
+        raise HTTPException(status_code=500, detail=f"صيغة غير مدعومة: {target_ext}")
+
+    outdir = os.path.dirname(output_path) or "."
+    try:
+        subprocess.run(
+            [
+                "libreoffice", "--headless",
+                "--convert-to", target_ext,
+                "--outdir", outdir,
+                input_path,
+            ],
+            check=True,
+            capture_output=True,
+            timeout=90,
+        )
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=504, detail="انتهت مهلة تحويل الملف — جرّب ملف أصغر")
+    except subprocess.CalledProcessError as e:
+        stderr_snippet = (e.stderr or b"").decode("utf-8", "ignore")[:200]
+        raise HTTPException(
+            status_code=500,
+            detail=f"تعذّر تحويل الملف. ربما الملف تالف أو يستخدم تنسيقاً معقداً. تفاصيل: {stderr_snippet}",
+        )
+
+    # LibreOffice writes <input_basename>.<target_ext> into outdir; move
+    # it to our canonical path so downstream code doesn't need to know
+    # about that convention.
+    input_base = os.path.splitext(os.path.basename(input_path))[0]
+    default_out = os.path.join(outdir, f"{input_base}.{target_ext}")
+    if not os.path.exists(default_out):
+        raise HTTPException(status_code=500, detail="فشل التحويل: لم يُنشأ ملف الإخراج")
+    if os.path.abspath(default_out) != os.path.abspath(output_path):
+        shutil.move(default_out, output_path)
+
+
+def _convert_pdf_to_office(
     endpoint: str,
     input_path: str,
     output_path: str,
-    target_format,
+    target_ext: str,
+    adobe_format,
 ) -> bool:
-    """Run Adobe conversion with a cache in front.
+    """Run PDF→Office conversion with cache in front, provider auto-selected.
 
     Args:
-        endpoint: tool name for Adobe counter attribution ("pdf-to-word", ...)
+        endpoint: tool name for stats attribution ("pdf-to-word" / "pdf-to-excel")
         input_path: user-uploaded PDF
-        output_path: where the DOCX/XLSX result must end up
-        target_format: Adobe ExportPDFTargetFormat enum member
+        output_path: destination for the DOCX/XLSX result
+        target_ext: "docx" or "xlsx" (used for cache key + LibreOffice)
+        adobe_format: Adobe ExportPDFTargetFormat enum (used only when
+            USE_ADOBE is enabled)
 
     Returns:
-        True if served from cache (Adobe skipped), False if Adobe ran.
+        True if served from cache; False if a provider was invoked.
 
-    Safety net: if the cache module raises for any reason, we fall back to
-    running Adobe directly — never let a cache bug break the tool.
+    Provider precedence:
+        1. If cache HIT for the current provider+version → return the cached
+           bytes (Adobe transactions untouched)
+        2. Else if USE_ADOBE=true → call Adobe SDK
+        3. Else (default) → call LibreOffice
     """
-    if not CACHE_ENABLED:
-        process_pdf_adobe_v4(input_path, output_path, target_format)
-        cache_stats.record_adobe_transaction(endpoint)
-        return False
+    provider_name = "adobe" if USE_ADOBE else "libreoffice"
+    provider_version = ADOBE_PROVIDER_VERSION if USE_ADOBE else LIBREOFFICE_PROVIDER_VERSION
 
-    try:
-        target_str = str(target_format).split(".")[-1].lower()  # "docx" or "xlsx"
-        key = pdf_cache.CacheKey(
-            input_sha256=pdf_cache.hash_file(input_path),
-            target_format=target_str,
-            provider_name="adobe",
-            provider_version=ADOBE_PROVIDER_VERSION,
-            password_hash="",  # these two Adobe endpoints don't take passwords
-        )
-        cached_path = pdf_cache.get(key)
-        if cached_path is not None:
-            shutil.copyfile(cached_path, output_path)
-            cache_stats.record_cache_hit()
-            return True
-
-        cache_stats.record_cache_miss()
-    except Exception:
-        # Cache lookup failed — fall through to normal Adobe path, don't
-        # break the user's request. Miss/hit counters may be inaccurate
-        # for this call; acceptable trade-off.
-        cached_path = None
-
-    # Cache miss path: run Adobe as before
-    process_pdf_adobe_v4(input_path, output_path, target_format)
-    cache_stats.record_adobe_transaction(endpoint)
-
-    # Populate cache for next time — failures here shouldn't affect the user.
+    key = None
     if CACHE_ENABLED:
+        try:
+            key = pdf_cache.CacheKey(
+                input_sha256=pdf_cache.hash_file(input_path),
+                target_format=target_ext,
+                provider_name=provider_name,
+                provider_version=provider_version,
+                password_hash="",
+            )
+            cached_path = pdf_cache.get(key)
+            if cached_path is not None:
+                shutil.copyfile(cached_path, output_path)
+                cache_stats.record_cache_hit()
+                return True
+            cache_stats.record_cache_miss()
+        except Exception:
+            # Cache lookup broken — fall through to provider call.
+            key = None
+
+    # Provider dispatch
+    if USE_ADOBE:
+        process_pdf_adobe_v4(input_path, output_path, adobe_format)
+        cache_stats.record_adobe_transaction(endpoint)
+    else:
+        process_pdf_libreoffice(input_path, output_path, target_ext)
+
+    # Populate cache for next time — never let a cache write failure break
+    # a successful conversion.
+    if CACHE_ENABLED and key is not None:
         try:
             pdf_cache.put(key, output_path)
         except Exception:
@@ -519,7 +579,7 @@ async def convert_pdf_to_word(request: Request, background_tasks: BackgroundTask
     input_path = os.path.join(jdir, "input.bin")
     output_path = os.path.join(jdir, "converted.docx")
     try:
-        _cached_or_adobe_convert("pdf-to-word", input_path, output_path, ExportPDFTargetFormat.DOCX)
+        _convert_pdf_to_office("pdf-to-word", input_path, output_path, "docx", ExportPDFTargetFormat.DOCX)
         base = os.path.splitext(orig)[0] or "document"
         response_data = _make_response(
             job_id,
@@ -529,6 +589,10 @@ async def convert_pdf_to_word(request: Request, background_tasks: BackgroundTask
         )
         background_tasks.add_task(_delete_job_after_delay, job_id)
         return response_data
+    except HTTPException:
+        # Preserve the tailored status + Arabic detail already raised by the provider.
+        background_tasks.add_task(_delete_job_after_delay, job_id, delay_seconds=5)
+        raise
     except Exception as e:
         background_tasks.add_task(_delete_job_after_delay, job_id, delay_seconds=5)
         raise HTTPException(status_code=500, detail=f"حدث خطأ: {str(e)}")
@@ -541,7 +605,7 @@ async def convert_pdf_to_excel(request: Request, background_tasks: BackgroundTas
     input_path = os.path.join(jdir, "input.bin")
     output_path = os.path.join(jdir, "converted.xlsx")
     try:
-        _cached_or_adobe_convert("pdf-to-excel", input_path, output_path, ExportPDFTargetFormat.XLSX)
+        _convert_pdf_to_office("pdf-to-excel", input_path, output_path, "xlsx", ExportPDFTargetFormat.XLSX)
         base = os.path.splitext(orig)[0] or "document"
         response_data = _make_response(
             job_id,
@@ -551,6 +615,9 @@ async def convert_pdf_to_excel(request: Request, background_tasks: BackgroundTas
         )
         background_tasks.add_task(_delete_job_after_delay, job_id)
         return response_data
+    except HTTPException:
+        background_tasks.add_task(_delete_job_after_delay, job_id, delay_seconds=5)
+        raise
     except Exception as e:
         background_tasks.add_task(_delete_job_after_delay, job_id, delay_seconds=5)
         raise HTTPException(status_code=500, detail=f"حدث خطأ: {str(e)}")
