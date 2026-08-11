@@ -68,19 +68,22 @@ from adobe.pdfservices.operation.pdfjobs.params.export_pdf.export_pdf_target_for
 from adobe.pdfservices.operation.pdfjobs.result.export_pdf_result import ExportPDFResult
 
 # ───────────────────────────────────────────────────────────────────────
-# Result cache + usage tracking (Phase 1 of arch redesign, 2026-08-05)
+# Adobe usage tracker (privacy fix 2026-08-11)
 # ───────────────────────────────────────────────────────────────────────
-# Design goal: skip Adobe transactions when the same file was already
-# converted recently. Also tracks Adobe usage per endpoint so the admin
-# dashboard can show remaining monthly quota.
+# The file cache was removed to match the site's published privacy
+# promise: user files (input and output alike) are deleted within one
+# hour and never retained. The previous SHA-256 cache held DOCX/XLSX
+# results for 24h — a direct contradiction. See CACHE_ENABLED elsewhere
+# for the flag that used to gate this; it now hard-defaults to False and
+# no code path caches user file bytes.
 #
-# Feature flag CACHE_ENABLED controls whether cache lookups happen — set
-# to "false" (default) means the wrapper functions bypass entirely and
-# behavior is identical to the pre-cache codebase. Rollback = env var.
-import cache as pdf_cache
+# cache_stats is still imported so the admin dashboard can surface
+# Adobe transaction counters. It never stores file content.
 import cache_stats
 
-CACHE_ENABLED = os.environ.get("CACHE_ENABLED", "false").lower() == "true"
+# Hard-disabled. Kept as a constant only so callers can reference it
+# without another rename churn. Never set to True.
+CACHE_ENABLED = False
 
 # Bump this on Adobe SDK upgrades or format-changing config changes so
 # stored cache entries invalidate automatically. Format: freeform tag.
@@ -99,21 +102,122 @@ ADMIN_STATS_TOKEN = os.environ.get("ADMIN_STATS_TOKEN")
 # ───────────────────────────────────────────────────────────────────────
 limiter = Limiter(key_func=get_remote_address, default_limits=["120/hour", "60/minute"])
 
-app = FastAPI(title="PDFMasry API Complete", version="5.1-secure")
+app = FastAPI(title="PDFMasry API Complete", version="5.2-hardened")
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
+
+# ─── Structured logging + request_id middleware ─────────────────────
+# Every request gets a UUID that flows into both the JSON error body
+# returned to the client and the server-side log line. When a user
+# reports "conversion failed on X", we can grep the log for their
+# request_id and find the exact stack, without exposing internals in
+# the response.
+import logging
+import uuid as _uuid
+from starlette.middleware.base import BaseHTTPMiddleware
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] rid=%(request_id)s %(message)s",
+)
+_logger = logging.getLogger("pdfmasry")
+
+
+class _RequestIdFilter(logging.Filter):
+    """Injects request_id from the current request context if available."""
+    def filter(self, record):
+        rid = getattr(record, "request_id", None) or "-"
+        record.request_id = rid
+        return True
+
+
+for h in logging.getLogger().handlers:
+    h.addFilter(_RequestIdFilter())
+
+
+class RequestIdMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        rid = request.headers.get("X-Request-ID") or _uuid.uuid4().hex
+        request.state.request_id = rid
+        try:
+            response = await call_next(request)
+        except HTTPException:
+            raise
+        except Exception as e:
+            # Catch-all so uncaught exceptions never leak stack traces.
+            # Detail is logged internally; client gets a stable generic message.
+            _logger.exception("unhandled: %s", type(e).__name__, extra={"request_id": rid})
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "detail": "حدث خطأ غير متوقع. يرجى إعادة المحاولة.",
+                    "request_id": rid,
+                },
+                headers={"X-Request-ID": rid},
+            )
+        response.headers["X-Request-ID"] = rid
+        return response
+
+
+app.add_middleware(RequestIdMiddleware)
+
+
+def _rid(request: Request) -> str:
+    """Extract request_id previously injected by the middleware."""
+    return getattr(request.state, "request_id", "-")
+
+
+async def _run_subprocess(cmd: list[str], timeout: int = 60) -> None:
+    """Run a subprocess without blocking the event loop.
+
+    Uses asyncio.to_thread so the FastAPI worker keeps serving other
+    requests while Ghostscript / qpdf / LibreOffice / pdftoppm churn.
+    Enforces a per-call timeout, kills the process tree on expiry, and
+    re-raises subprocess.CalledProcessError / TimeoutExpired unchanged
+    so callers can pattern-match.
+    """
+    def _sync():
+        return subprocess.run(cmd, check=True, capture_output=True, timeout=timeout)
+    await asyncio.to_thread(_sync)
+
+
+def _safe_http_exception(request: Request, status: int, user_detail: str, internal_reason: str = "") -> HTTPException:
+    """Build an HTTPException that carries a user-safe message + request_id
+    while logging the internal reason server-side only. Prefer this over
+    raising raw HTTPException(detail=str(e)) — that leaks stack info.
+    """
+    rid = _rid(request)
+    if internal_reason:
+        _logger.error("%s: %s", user_detail, internal_reason, extra={"request_id": rid})
+    return HTTPException(
+        status_code=status,
+        detail=user_detail,
+        headers={"X-Request-ID": rid},
+    )
+
 # إعدادات الأمان (CORS) لحماية الباندويث الخاص بك
+# CORS allow-list: env-driven so a preview / staging service can whitelist
+# its Netlify Deploy Preview URL without touching production. Comma-separated
+# via CORS_EXTRA_ORIGINS. The static list keeps production origins that
+# don't change deploy-to-deploy.
+_static_origins = [
+    "https://pdfmasry.com",
+    "https://www.pdfmasry.com",
+    "https://taupe-rugelach-921837.netlify.app",  # historical Netlify site
+    "https://pdfmasry-staging.netlify.app",       # main Netlify project
+    "http://localhost:4321",
+    "http://localhost:4322",
+]
+_extra_origins_env = os.environ.get("CORS_EXTRA_ORIGINS", "").strip()
+_extra_origins = [
+    o.strip() for o in _extra_origins_env.split(",") if o.strip()
+] if _extra_origins_env else []
+_allowed_origins = _static_origins + _extra_origins
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://pdfmasry.com",
-        "https://www.pdfmasry.com",
-        "https://taupe-rugelach-921837.netlify.app",
-        "https://pdfmasry-staging.netlify.app",
-        "http://localhost:4321",
-        "http://localhost:4322",
-    ],
+    allow_origins=_allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -123,10 +227,37 @@ app.add_middleware(
 UPLOAD_DIR = "./temp_files"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-# Secret used to sign download tokens. Set DOWNLOAD_SECRET on Railway.
-# A missing secret still boots the server (falls back to a random per-boot
-# value) — but tokens generated by one boot cannot be verified by another.
-DOWNLOAD_SECRET = os.environ.get("DOWNLOAD_SECRET") or secrets.token_urlsafe(32)
+# NOTE: A previous revision of this file called shutil.rmtree() on the
+# legacy ./cache directory at boot time. Review round 2 rejected that
+# pattern — auto-delete on startup, with ignore_errors=True and a path
+# partially derived from PDF_CACHE_DIR, is unsafe and could wipe the
+# wrong target if the env var was misconfigured. Removed. Any actual
+# purge on production goes through scripts/purge_legacy_cache.py which
+# is dry-run by default and requires --execute plus a hardcoded
+# allowlist of paths.
+
+# Secret used to sign download tokens. MUST be provided via env in
+# production/staging — otherwise multi-replica deploys mint tokens with
+# different per-boot secrets and users' download links break at random.
+# The old code silently generated a random per-boot fallback; reviewer
+# round 2 flagged that. We now fail loud unless APP_ENV=development.
+#
+# Set APP_ENV=production (or =staging) + DOWNLOAD_SECRET on Railway.
+# For local dev leave APP_ENV=development (default) and the random
+# per-boot value is fine because you're the only replica.
+APP_ENV = os.environ.get("APP_ENV", "development").lower()
+_DOWNLOAD_SECRET_ENV = os.environ.get("DOWNLOAD_SECRET")
+if not _DOWNLOAD_SECRET_ENV:
+    if APP_ENV in {"production", "staging"}:
+        raise RuntimeError(
+            "DOWNLOAD_SECRET is not set. Refusing to boot in "
+            f"APP_ENV={APP_ENV!r} because a per-boot random secret "
+            "would break download links across replicas or restarts."
+        )
+    # dev only — random per-boot is acceptable for a single local worker
+    DOWNLOAD_SECRET = secrets.token_urlsafe(32)
+else:
+    DOWNLOAD_SECRET = _DOWNLOAD_SECRET_ENV
 DOWNLOAD_TOKEN_TTL_SECONDS = 60 * 60  # 1 hour
 JOB_TTL_SECONDS = 60 * 60             # cleanup after 1 hour
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024   # 50 MB — matches frontend claim
@@ -163,6 +294,11 @@ def _validate_input(path: str, allowed_families: set[str]) -> None:
     """Raise HTTPException if the file at `path` isn't in `allowed_families`.
     Files that don't match any known magic → 415.
     Empty files → 400.
+
+    For Office ZIP-based files (docx/xlsx) the family match alone isn't
+    enough — any ZIP starts with 'PK\x03\x04'. We call _validate_office_zip
+    to inspect the archive's own membership list before accepting it,
+    which blocks disguised ZIPs and ZIP bombs.
     """
     try:
         size = os.path.getsize(path)
@@ -181,6 +317,91 @@ def _validate_input(path: str, allowed_families: set[str]) -> None:
             status_code=415,
             detail="نوع الملف لا يتوافق مع هذه الأداة",
         )
+    # Deeper structural check for the ZIP-based Office formats we accept
+    if family == "office_zip":
+        want = None
+        if "office_zip_docx" in allowed_families:
+            want = "docx"
+        elif "office_zip_xlsx" in allowed_families:
+            want = "xlsx"
+        # If the caller didn't pin a specific Office subtype we still want
+        # both defenses (Zip Slip + bomb caps) applied to whichever it is.
+        _validate_office_zip(path, want)
+
+
+# ─── Office ZIP hardening (Phase 1 sec 2026-08-11) ─────────────────
+# Limits chosen so a well-formed 50 MB DOCX/XLSX passes but common
+# ZIP-bomb patterns (nested archives, extreme compression ratios) trip
+# the guards long before Python's zipfile allocates gigabytes.
+
+_MAX_ZIP_ENTRIES = 5000              # a real Office doc rarely exceeds 500
+_MAX_ZIP_UNCOMPRESSED_BYTES = 500 * 1024 * 1024   # 500 MB total
+_MAX_ZIP_COMPRESSION_RATIO = 200     # anything higher is almost certainly a bomb
+
+
+def _validate_office_zip(path: str, want: str | None) -> None:
+    """Inspect a ZIP archive to confirm it's a real DOCX/XLSX (not a
+    disguised ZIP or a decompression bomb) BEFORE any downstream tool
+    opens it.
+
+    Checks:
+      - archive opens as a ZIP (rules out truncated / non-ZIP disguised)
+      - entry count within limit
+      - no Zip Slip: no absolute paths, no '..' segments, no drive letters
+      - total uncompressed size within limit
+      - per-entry compression ratio within limit
+      - required Office members exist for the declared type
+    """
+    import zipfile
+
+    try:
+        zf = zipfile.ZipFile(path, "r")
+    except zipfile.BadZipFile:
+        raise HTTPException(status_code=415, detail="الملف ليس Office صالحاً")
+
+    try:
+        entries = zf.infolist()
+        if len(entries) > _MAX_ZIP_ENTRIES:
+            raise HTTPException(status_code=413, detail="الملف يحتوي على عدد كبير جداً من العناصر")
+
+        total_uncompressed = 0
+        names = set()
+        for info in entries:
+            # Zip Slip defense — reject any suspicious path shape
+            name = info.filename
+            if not name or name.startswith("/") or name.startswith("\\"):
+                raise HTTPException(status_code=415, detail="مسار مشبوه داخل الملف")
+            if ".." in name.split("/") or ".." in name.split("\\"):
+                raise HTTPException(status_code=415, detail="مسار مشبوه داخل الملف")
+            if len(name) > 2 and name[1] == ":":  # e.g. C:\...
+                raise HTTPException(status_code=415, detail="مسار مشبوه داخل الملف")
+
+            total_uncompressed += info.file_size
+            if total_uncompressed > _MAX_ZIP_UNCOMPRESSED_BYTES:
+                raise HTTPException(status_code=413, detail="الحجم بعد فك الضغط يتجاوز الحد المسموح")
+
+            if info.compress_size > 0:
+                ratio = info.file_size / info.compress_size
+                if ratio > _MAX_ZIP_COMPRESSION_RATIO:
+                    raise HTTPException(status_code=415, detail="نسبة الضغط مشبوهة (احتمال zip bomb)")
+
+            names.add(name)
+
+        # Required Office members — the presence of these tells us the
+        # ZIP is actually a Word/Excel document, not just any archive.
+        if "[Content_Types].xml" not in names:
+            raise HTTPException(status_code=415, detail="الملف ليس Office صالحاً")
+
+        if want == "docx":
+            need = {"word/document.xml"}
+            if not need.issubset(names):
+                raise HTTPException(status_code=415, detail="الملف ليس مستند Word صالحاً")
+        elif want == "xlsx":
+            need = {"xl/workbook.xml"}
+            if not need.issubset(names):
+                raise HTTPException(status_code=415, detail="الملف ليس مستند Excel صالحاً")
+    finally:
+        zf.close()
 
 
 # ───────────────────────────────────────────────────────────────────────
@@ -273,7 +494,8 @@ async def _save_upload_to_job(file: UploadFile, allowed_families: set[str]) -> t
         raise
     except Exception as e:
         shutil.rmtree(jdir, ignore_errors=True)
-        raise HTTPException(status_code=500, detail=f"فشل استقبال الملف: {str(e)}")
+        _logger.exception("upload save failed: %s", type(e).__name__)
+        raise HTTPException(status_code=500, detail="فشل استقبال الملف. يرجى المحاولة مرة أخرى.")
 
     return job_id, jdir, _sanitize_filename(file.filename or "file")
 
@@ -363,11 +585,13 @@ def admin_cache_stats(request: Request):
     supplied = request.query_params.get("token") or request.headers.get("X-Admin-Token", "")
     if not hmac.compare_digest(supplied, ADMIN_STATS_TOKEN):
         raise HTTPException(status_code=401, detail="Invalid admin token")
+    # cache_health removed — the file cache was retired (privacy fix).
+    # Kept the endpoint shape as much as possible for backward compat.
     return {
         "cache_enabled": CACHE_ENABLED,
         "adobe_provider_version": ADOBE_PROVIDER_VERSION,
         "counters": cache_stats.snapshot(monthly_quota=ADOBE_MONTHLY_QUOTA),
-        "cache_health": pdf_cache.stats(),
+        "cache_health": {"disabled": True, "entry_count": 0, "total_bytes": 0},
     }
 
 
@@ -481,9 +705,10 @@ def process_pdf_to_docx(input_path: str, output_path: str) -> None:
         finally:
             cv.close()
     except Exception as e:
+        _logger.exception("pdf→docx failed: %s", type(e).__name__)
         raise HTTPException(
             status_code=500,
-            detail=f"تعذّر تحويل الملف إلى Word — ربما الملف تالف أو مشفَّر. ({str(e)[:150]})",
+            detail="تعذّر تحويل الملف إلى Word — ربما الملف تالف أو مشفَّر.",
         )
 
     if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
@@ -544,83 +769,52 @@ def process_pdf_to_xlsx(input_path: str, output_path: str) -> None:
     except HTTPException:
         raise
     except Exception as e:
+        _logger.exception("pdf→xlsx failed: %s", type(e).__name__)
         raise HTTPException(
             status_code=500,
-            detail=f"تعذّر تحويل الملف إلى Excel. ({str(e)[:150]})",
+            detail="تعذّر تحويل الملف إلى Excel.",
         )
 
     if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
         raise HTTPException(status_code=500, detail="فشل التحويل: لم يُنشأ ملف Excel صالح")
 
 
-def _convert_pdf_to_office(
+async def _convert_pdf_to_office(
     endpoint: str,
     input_path: str,
     output_path: str,
     target_ext: str,
     adobe_format,
-) -> bool:
-    """Run PDF→Office conversion with cache in front, provider auto-selected.
+) -> None:
+    """Run PDF→Office conversion with provider auto-selection. No caching.
 
     Args:
         endpoint: tool name for stats attribution ("pdf-to-word" / "pdf-to-excel")
         input_path: user-uploaded PDF
         output_path: destination for the DOCX/XLSX result
-        target_ext: "docx" or "xlsx" (used for cache key + LibreOffice)
-        adobe_format: Adobe ExportPDFTargetFormat enum (used only when
+        target_ext: "docx" or "xlsx"
+        adobe_format: Adobe ExportPDFTargetFormat enum (only used when
             USE_ADOBE is enabled)
 
-    Returns:
-        True if served from cache; False if a provider was invoked.
-
     Provider precedence:
-        1. If cache HIT for the current provider+version → return the cached
-           bytes (Adobe transactions untouched)
-        2. Else if USE_ADOBE=true → call Adobe SDK
-        3. Else (default) → call LibreOffice
+        1. USE_ADOBE=true → Adobe SDK
+        2. otherwise → pdf2docx / pdfplumber (self-hosted)
+
+    File cache was removed to match the site's published 1-hour deletion
+    promise. Every request pays the full conversion cost; that's fine —
+    pdf2docx typically runs in 0.5-2s per document.
     """
-    provider_name = "adobe" if USE_ADOBE else "libreoffice"
-    provider_version = ADOBE_PROVIDER_VERSION if USE_ADOBE else LIBREOFFICE_PROVIDER_VERSION
-
-    key = None
-    if CACHE_ENABLED:
-        try:
-            key = pdf_cache.CacheKey(
-                input_sha256=pdf_cache.hash_file(input_path),
-                target_format=target_ext,
-                provider_name=provider_name,
-                provider_version=provider_version,
-                password_hash="",
-            )
-            cached_path = pdf_cache.get(key)
-            if cached_path is not None:
-                shutil.copyfile(cached_path, output_path)
-                cache_stats.record_cache_hit()
-                return True
-            cache_stats.record_cache_miss()
-        except Exception:
-            # Cache lookup broken — fall through to provider call.
-            key = None
-
-    # Provider dispatch
     if USE_ADOBE:
-        process_pdf_adobe_v4(input_path, output_path, adobe_format)
+        await asyncio.to_thread(process_pdf_adobe_v4, input_path, output_path, adobe_format)
         cache_stats.record_adobe_transaction(endpoint)
     elif target_ext == "docx":
-        process_pdf_to_docx(input_path, output_path)
+        # to_thread keeps FastAPI's event loop responsive while pdf2docx
+        # crunches PyMuPDF-heavy work in the background thread pool.
+        await asyncio.to_thread(process_pdf_to_docx, input_path, output_path)
     elif target_ext == "xlsx":
-        process_pdf_to_xlsx(input_path, output_path)
+        await asyncio.to_thread(process_pdf_to_xlsx, input_path, output_path)
     else:
         raise HTTPException(status_code=500, detail=f"صيغة إخراج غير مدعومة: {target_ext}")
-
-    # Populate cache for next time — never let a cache write failure break
-    # a successful conversion.
-    if CACHE_ENABLED and key is not None:
-        try:
-            pdf_cache.put(key, output_path)
-        except Exception:
-            pass
-    return False
 
 
 @app.post("/api/pdf-to-word")
@@ -630,7 +824,7 @@ async def convert_pdf_to_word(request: Request, background_tasks: BackgroundTask
     input_path = os.path.join(jdir, "input.bin")
     output_path = os.path.join(jdir, "converted.docx")
     try:
-        _convert_pdf_to_office("pdf-to-word", input_path, output_path, "docx", ExportPDFTargetFormat.DOCX)
+        await _convert_pdf_to_office("pdf-to-word", input_path, output_path, "docx", ExportPDFTargetFormat.DOCX)
         base = os.path.splitext(orig)[0] or "document"
         response_data = _make_response(
             job_id,
@@ -646,7 +840,8 @@ async def convert_pdf_to_word(request: Request, background_tasks: BackgroundTask
         raise
     except Exception as e:
         background_tasks.add_task(_delete_job_after_delay, job_id, delay_seconds=5)
-        raise HTTPException(status_code=500, detail=f"حدث خطأ: {str(e)}")
+        _logger.exception("pdf-to-word endpoint: %s", type(e).__name__)
+        raise HTTPException(status_code=500, detail="تعذّر تحويل الملف. يرجى المحاولة مرة أخرى.")
 
 
 @app.post("/api/pdf-to-excel")
@@ -656,7 +851,7 @@ async def convert_pdf_to_excel(request: Request, background_tasks: BackgroundTas
     input_path = os.path.join(jdir, "input.bin")
     output_path = os.path.join(jdir, "converted.xlsx")
     try:
-        _convert_pdf_to_office("pdf-to-excel", input_path, output_path, "xlsx", ExportPDFTargetFormat.XLSX)
+        await _convert_pdf_to_office("pdf-to-excel", input_path, output_path, "xlsx", ExportPDFTargetFormat.XLSX)
         base = os.path.splitext(orig)[0] or "document"
         response_data = _make_response(
             job_id,
@@ -671,7 +866,8 @@ async def convert_pdf_to_excel(request: Request, background_tasks: BackgroundTas
         raise
     except Exception as e:
         background_tasks.add_task(_delete_job_after_delay, job_id, delay_seconds=5)
-        raise HTTPException(status_code=500, detail=f"حدث خطأ: {str(e)}")
+        _logger.exception("pdf-to-excel endpoint: %s", type(e).__name__)
+        raise HTTPException(status_code=500, detail="تعذّر تحويل الملف. يرجى المحاولة مرة أخرى.")
 
 # ───────────────────────────────────────────────────────────────────────
 # 4. الأدوات المجانية (Ghostscript, qpdf, LibreOffice, Poppler) — PDF
@@ -686,7 +882,7 @@ async def compress_pdf(request: Request, background_tasks: BackgroundTasks, file
         cmd = ["gs", "-sDEVICE=pdfwrite", "-dCompatibilityLevel=1.4",
                "-dPDFSETTINGS=/screen", "-dNOPAUSE", "-dQUIET", "-dBATCH",
                f"-sOutputFile={output_path}", input_path]
-        subprocess.run(cmd, check=True, capture_output=True)
+        await _run_subprocess(cmd, timeout=60)
         response_data = _make_response(job_id, output_path, f"compressed_{orig}", "application/pdf")
         background_tasks.add_task(_delete_job_after_delay, job_id)
         return response_data
@@ -708,7 +904,7 @@ async def protect_pdf(
     output_path = os.path.join(jdir, "protected.pdf")
     try:
         cmd = ["qpdf", "--encrypt", password, password, "256", "--", input_path, output_path]
-        subprocess.run(cmd, check=True, capture_output=True)
+        await _run_subprocess(cmd, timeout=45)
         response_data = _make_response(job_id, output_path, f"protected_{orig}", "application/pdf")
         background_tasks.add_task(_delete_job_after_delay, job_id)
         return response_data
@@ -730,7 +926,7 @@ async def unlock_pdf(
     output_path = os.path.join(jdir, "unlocked.pdf")
     try:
         cmd = ["qpdf", f"--password={password}", "--decrypt", input_path, output_path]
-        subprocess.run(cmd, check=True, capture_output=True)
+        await _run_subprocess(cmd, timeout=45)
         response_data = _make_response(job_id, output_path, f"unlocked_{orig}", "application/pdf")
         background_tasks.add_task(_delete_job_after_delay, job_id)
         return response_data
@@ -748,7 +944,7 @@ async def pdf_to_image(request: Request, background_tasks: BackgroundTasks, file
     os.makedirs(pages_dir, exist_ok=True)
     try:
         cmd = ["pdftoppm", "-jpeg", "-r", "150", input_path, os.path.join(pages_dir, "page")]
-        subprocess.run(cmd, check=True, capture_output=True)
+        await _run_subprocess(cmd, timeout=90)
 
         zip_base = os.path.join(jdir, "pages_archive")
         shutil.make_archive(zip_base, "zip", pages_dir)
@@ -777,7 +973,7 @@ async def office_to_pdf(request: Request, background_tasks: BackgroundTasks, fil
 
     try:
         cmd = ["libreoffice", "--headless", "--convert-to", "pdf", input_path, "--outdir", jdir]
-        subprocess.run(cmd, check=True, capture_output=True)
+        await _run_subprocess(cmd, timeout=120)
         # LibreOffice writes <basename>.pdf where basename = os.path.splitext(input_filename)[0]
         libre_output = os.path.join(jdir, f"input.pdf")
         if not os.path.exists(libre_output):
