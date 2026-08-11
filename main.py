@@ -560,11 +560,13 @@ def admin_cache_stats(request: Request):
     supplied = request.query_params.get("token") or request.headers.get("X-Admin-Token", "")
     if not hmac.compare_digest(supplied, ADMIN_STATS_TOKEN):
         raise HTTPException(status_code=401, detail="Invalid admin token")
+    # cache_health removed — the file cache was retired (privacy fix).
+    # Kept the endpoint shape as much as possible for backward compat.
     return {
         "cache_enabled": CACHE_ENABLED,
         "adobe_provider_version": ADOBE_PROVIDER_VERSION,
         "counters": cache_stats.snapshot(monthly_quota=ADOBE_MONTHLY_QUOTA),
-        "cache_health": pdf_cache.stats(),
+        "cache_health": {"disabled": True, "entry_count": 0, "total_bytes": 0},
     }
 
 
