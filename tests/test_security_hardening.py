@@ -255,3 +255,92 @@ def test_safe_http_exception_never_includes_stack(monkeypatch):
     assert "RuntimeError" not in exc.detail
     assert "passwd" not in exc.detail
     assert exc.headers["X-Request-ID"] == "test-rid-123"
+
+
+# ─── DOWNLOAD_SECRET fail-loud (review round 2 note 5) ─────────────────
+
+def test_download_secret_random_only_in_development():
+    """APP_ENV=development is allowed to auto-generate. Anything else
+    must have DOWNLOAD_SECRET explicitly set — verified by re-importing
+    main.py with monkeypatched env."""
+    import importlib
+
+    # 1. dev with no secret → OK, module boots with a random one
+    os.environ.pop("DOWNLOAD_SECRET", None)
+    os.environ["APP_ENV"] = "development"
+    importlib.reload(main)
+    assert isinstance(main.DOWNLOAD_SECRET, str)
+    assert len(main.DOWNLOAD_SECRET) >= 32
+
+    # 2. production with no secret → RuntimeError at import time
+    os.environ["APP_ENV"] = "production"
+    with pytest.raises(RuntimeError) as exc:
+        importlib.reload(main)
+    assert "DOWNLOAD_SECRET" in str(exc.value)
+    assert "production" in str(exc.value)
+
+    # 3. production WITH secret → OK, module uses the provided value
+    os.environ["DOWNLOAD_SECRET"] = "known-test-secret-not-real"
+    importlib.reload(main)
+    assert main.DOWNLOAD_SECRET == "known-test-secret-not-real"
+
+    # 4. staging behaves like production
+    os.environ.pop("DOWNLOAD_SECRET", None)
+    os.environ["APP_ENV"] = "staging"
+    with pytest.raises(RuntimeError):
+        importlib.reload(main)
+
+    # cleanup — restore dev mode + a fresh random for other tests
+    os.environ["APP_ENV"] = "development"
+    os.environ.pop("DOWNLOAD_SECRET", None)
+    importlib.reload(main)
+
+
+def test_cors_extra_origins_appended():
+    """CORS_EXTRA_ORIGINS is comma-separated env — Deploy Preview URL goes
+    here so staging service can whitelist it without a code change."""
+    import importlib
+    os.environ["CORS_EXTRA_ORIGINS"] = (
+        "https://deploy-preview-1--pdfmasry-staging.netlify.app,"
+        "https://another.example.com"
+    )
+    importlib.reload(main)
+    origins = main._allowed_origins
+    assert "https://deploy-preview-1--pdfmasry-staging.netlify.app" in origins
+    assert "https://another.example.com" in origins
+    # Existing static origins still there
+    assert "https://pdfmasry.com" in origins
+    # Cleanup
+    os.environ.pop("CORS_EXTRA_ORIGINS", None)
+    importlib.reload(main)
+
+
+# ─── Startup safety (review round 2 note 1) ────────────────────────────
+
+def test_no_startup_cache_purge():
+    """Boot-time shutil.rmtree() on cache dirs was removed. Verify the
+    _LEGACY_CACHE_DIRS constant and boot-time rmtree calls are gone."""
+    src = open(os.path.join(os.path.dirname(__file__), "..", "main.py")).read()
+    assert "_LEGACY_CACHE_DIRS" not in src, (
+        "_LEGACY_CACHE_DIRS should be gone — its removal is the whole point"
+    )
+    # rmtree still allowed inside per-job cleanup (_delete_job_after_delay,
+    # _save_upload_to_job on error) but NOT at module top level. Check
+    # every rmtree call is inside a function body.
+    lines = src.splitlines()
+    for i, line in enumerate(lines, 1):
+        if "shutil.rmtree(" in line and not line.lstrip().startswith("#"):
+            # find enclosing def
+            enclosing_def = None
+            for j in range(i - 1, 0, -1):
+                stripped = lines[j - 1]
+                if stripped.startswith("def ") or stripped.startswith("async def "):
+                    enclosing_def = stripped
+                    break
+                if stripped and not stripped.startswith(" ") and not stripped.startswith("\t"):
+                    # hit a top-level statement without finding a def
+                    break
+            assert enclosing_def, (
+                f"shutil.rmtree at main.py:{i} not inside a function — "
+                "startup purge must not exist"
+            )
