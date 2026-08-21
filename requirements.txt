@@ -4,5 +4,8 @@ python-multipart
 pdfservices-sdk
 slowapi
 pdf2docx
+PyMuPDF
 pdfplumber
+python-bidi
+python-docx
 openpyxl

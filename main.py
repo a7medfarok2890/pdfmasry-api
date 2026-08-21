@@ -454,7 +454,10 @@ def head_download_file(job_id: str, token: str, request: Request):
 # preserved correctly which is the main constraint.
 
 USE_ADOBE = os.environ.get("USE_ADOBE", "false").lower() == "true"
-LIBREOFFICE_PROVIDER_VERSION = "libreoffice-cli-2026-08"
+SELF_HOSTED_PROVIDER_VERSIONS = {
+    "docx": "pdf2docx-arabic-rtl-v1",
+    "xlsx": "pdfplumber-xlsx-v1",
+}
 
 
 def process_pdf_to_docx(input_path: str, output_path: str) -> None:
@@ -463,8 +466,9 @@ def process_pdf_to_docx(input_path: str, output_path: str) -> None:
     Chosen over LibreOffice for two reasons:
       1. LibreOffice imports PDFs as Draw docs, so --convert-to docx just
          drops the content and produces an empty Writer file.
-      2. pdf2docx preserves text runs, tables, images, and — critically for
-         us — RTL text direction on Arabic content.
+      2. pdf2docx preserves text runs, tables, and images.  A post-processing
+         pass then restores Arabic numeric order, RTL OOXML flags, and totals
+         that pdf2docx may discard as overlapping content.
 
     Raises HTTPException 500 with a friendly Arabic message on failure.
     """
@@ -480,6 +484,10 @@ def process_pdf_to_docx(input_path: str, output_path: str) -> None:
             cv.convert(output_path)
         finally:
             cv.close()
+
+        from arabic_docx import repair_arabic_docx
+
+        repair_arabic_docx(input_path, output_path)
     except Exception as e:
         raise HTTPException(
             status_code=500,
@@ -579,8 +587,12 @@ def _convert_pdf_to_office(
         2. Else if USE_ADOBE=true → call Adobe SDK
         3. Else (default) → call LibreOffice
     """
-    provider_name = "adobe" if USE_ADOBE else "libreoffice"
-    provider_version = ADOBE_PROVIDER_VERSION if USE_ADOBE else LIBREOFFICE_PROVIDER_VERSION
+    provider_name = "adobe" if USE_ADOBE else f"selfhosted-{target_ext}"
+    provider_version = (
+        ADOBE_PROVIDER_VERSION
+        if USE_ADOBE
+        else SELF_HOSTED_PROVIDER_VERSIONS[target_ext]
+    )
 
     key = None
     if CACHE_ENABLED:
