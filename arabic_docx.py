@@ -21,6 +21,7 @@ import fitz
 import pdfplumber
 from bidi.algorithm import get_display
 from docx import Document
+from docx.enum.style import WD_STYLE_TYPE
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
@@ -336,6 +337,57 @@ def mark_paragraph_rtl(paragraph: Paragraph) -> None:
 def mark_table_rtl(table: Table) -> None:
     """Public wrapper around ``_mark_table_rtl`` — see ``mark_paragraph_rtl``."""
     _mark_table_rtl(table)
+
+
+def ensure_rtl_paragraph_style(
+    document: Document,
+    style_id: str,
+    font_name: str = "Arial",
+    spacing_before_twips: int | None = None,
+):
+    """Get-or-create a paragraph style with right alignment and bidi baked
+    into the style definition itself, rather than decided per-paragraph
+    from that paragraph's own text (which is what ``mark_paragraph_rtl``
+    does, correctly, for the self-hosted repair path where a document can
+    contain a real mix of Arabic and Latin paragraphs).
+
+    Some documents are RTL by construction end to end — every paragraph
+    in them should render right-aligned, including one whose entire text
+    is a number or a percentage with no Arabic characters of its own,
+    because it's a cell in an Arabic-oriented table, not because that
+    specific string happens to contain Arabic letters. Baking the
+    alignment into the style (as other Word-generation tools do) gets
+    this right without a per-paragraph content check.
+
+    Idempotent — a repeat call with the same style_id on the same
+    document returns the existing style instead of erroring.
+    """
+    styles = document.styles
+    try:
+        return styles[style_id]
+    except KeyError:
+        pass
+
+    style = styles.add_style(style_id, WD_STYLE_TYPE.PARAGRAPH)
+    style.base_style = styles["Normal"]
+    style.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    style.font.name = font_name
+
+    style_pPr = style.element.get_or_add_pPr()
+    _ensure_child(style_pPr, "w:bidi")
+    if spacing_before_twips is not None:
+        spacing = _ensure_child(style_pPr, "w:spacing")
+        spacing.set(qn("w:before"), str(spacing_before_twips))
+
+    style_rPr = style.element.get_or_add_rPr()
+    fonts = _ensure_child(style_rPr, "w:rFonts")
+    fonts.set(qn("w:ascii"), font_name)
+    fonts.set(qn("w:hAnsi"), font_name)
+    fonts.set(qn("w:cs"), font_name)
+    language = _ensure_child(style_rPr, "w:lang")
+    language.set(qn("w:bidi"), "ar-SA")
+
+    return style
 
 
 def repair_arabic_docx(pdf_path: str, docx_path: str) -> None:

@@ -42,7 +42,7 @@ from typing import Optional
 # main.py's cache keys on (provider_name, provider_version), so an
 # unbumped version means a cached result from before the change gets
 # served forever instead of a freshly regenerated one.
-DOCAI_PROVIDER_VERSION = "docai-v3-2026-08"
+DOCAI_PROVIDER_VERSION = "docai-v4-2026-08"
 DOCAI_TIMEOUT_SECONDS = int(os.environ.get("GOOGLE_DOCAI_TIMEOUT_SECONDS", "60"))
 
 # Document AI's synchronous processDocument call is capped at 15 pages for
@@ -218,9 +218,29 @@ def _bbox_overlaps(a, b, threshold: float = 0.5) -> bool:
     return (iw * ih / a_area) >= threshold
 
 
-def _add_docx_table(docx_doc, full_text: str, table) -> None:
+def _set_explicit_table_borders(docx_table) -> None:
+    """Set visible single-line borders directly in the table's own XML,
+    rather than relying solely on the "Table Grid" style name resolving
+    correctly in every Word/LibreOffice version that opens the file —
+    belt-and-suspenders so the table is never rendered borderless."""
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+
+    borders = OxmlElement("w:tblBorders")
+    for edge in ("top", "left", "bottom", "right", "insideH", "insideV"):
+        edge_el = OxmlElement(f"w:{edge}")
+        edge_el.set(qn("w:val"), "single")
+        edge_el.set(qn("w:sz"), "4")
+        edge_el.set(qn("w:space"), "0")
+        edge_el.set(qn("w:color"), "000000")
+        borders.append(edge_el)
+    docx_table._tbl.tblPr.append(borders)
+
+
+def _add_docx_table(docx_doc, full_text: str, table, table_style) -> None:
     """Append a real Word table (w:tbl) built from a Document AI table,
-    with the same RTL marking used everywhere else in the document."""
+    with the same RTL style used everywhere else in the document and
+    explicit visible borders."""
     import arabic_docx
 
     rows = list(table.header_rows) + list(table.body_rows)
@@ -230,6 +250,7 @@ def _add_docx_table(docx_doc, full_text: str, table) -> None:
 
     docx_table = docx_doc.add_table(rows=0, cols=col_count)
     docx_table.style = "Table Grid"
+    _set_explicit_table_borders(docx_table)
     for row in rows:
         row_cells = docx_table.add_row().cells
         for i, cell in enumerate(row.cells):
@@ -237,7 +258,7 @@ def _add_docx_table(docx_doc, full_text: str, table) -> None:
                 break
             row_cells[i].text = _layout_text(full_text, cell.layout) if cell.layout else ""
             for paragraph in row_cells[i].paragraphs:
-                arabic_docx.mark_paragraph_rtl(paragraph)
+                paragraph.style = table_style
     arabic_docx.mark_table_rtl(docx_table)
 
 
@@ -262,6 +283,19 @@ def _build_docx_from_ocr(ocr_document, form_document, output_path: str) -> None:
     import arabic_docx
 
     docx_doc = DocxDocument()
+
+    # RTL alignment is baked into these styles (jc="right" + bidi in the
+    # style definition itself), not decided per-paragraph from that
+    # paragraph's own text — this document is RTL by construction end to
+    # end, so a cell whose whole content is "100%" or "6,993,250" must
+    # still render right-aligned, matching how other Word-generation
+    # tools (e.g. iLovePDF) structure this rather than skipping alignment
+    # on paragraphs with no Arabic characters of their own.
+    body_style = arabic_docx.ensure_rtl_paragraph_style(docx_doc, "DocAI Body Text", font_name="Arial")
+    table_style = arabic_docx.ensure_rtl_paragraph_style(
+        docx_doc, "DocAI Table Paragraph", font_name="Arial", spacing_before_twips=14,
+    )
+
     ocr_text = ocr_document.text or ""
     form_text = form_document.text if form_document is not None else ""
     wrote_any = False
@@ -289,17 +323,15 @@ def _build_docx_from_ocr(ocr_document, form_document, output_path: str) -> None:
 
             for _sort_key, kind, obj in blocks:
                 if kind == "table":
-                    _add_docx_table(docx_doc, form_text, obj)
+                    _add_docx_table(docx_doc, form_text, obj, table_style)
                 else:
-                    p = docx_doc.add_paragraph(obj)
-                    arabic_docx.mark_paragraph_rtl(p)
+                    docx_doc.add_paragraph(obj, style=body_style)
                 wrote_any = True
         elif page.layout:
             for line in _layout_text(ocr_text, page.layout).splitlines():
                 if not line.strip():
                     continue
-                p = docx_doc.add_paragraph(line)
-                arabic_docx.mark_paragraph_rtl(p)
+                docx_doc.add_paragraph(line, style=body_style)
                 wrote_any = True
 
         if page_index < len(ocr_pages) - 1:
