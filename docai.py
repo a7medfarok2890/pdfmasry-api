@@ -173,7 +173,71 @@ def _layout_text(document_text: str, layout) -> str:
     return "".join(parts).strip()
 
 
+def _text_anchor_range(layout) -> tuple[int, int]:
+    """Return the (min_start, max_end) character offsets a Layout's
+    text_anchor covers in the document's full text. Used to detect overlap
+    between a paragraph and a table so the same text isn't emitted twice."""
+    if layout is None or not layout.text_anchor.text_segments:
+        return (0, 0)
+    starts = []
+    ends = []
+    for seg in layout.text_anchor.text_segments:
+        starts.append(int(seg.start_index) if seg.start_index else 0)
+        ends.append(int(seg.end_index))
+    return (min(starts), max(ends))
+
+
+def _table_range(table) -> tuple[int, int]:
+    """Union of every cell's text_anchor range in a Document AI table —
+    the span of full-document text this table already accounts for."""
+    starts = []
+    ends = []
+    for row in list(table.header_rows) + list(table.body_rows):
+        for cell in row.cells:
+            start, end = _text_anchor_range(cell.layout)
+            if end > start:
+                starts.append(start)
+                ends.append(end)
+    if not starts:
+        return (0, 0)
+    return (min(starts), max(ends))
+
+
+def _add_docx_table(docx_doc, full_text: str, table) -> None:
+    """Append a real Word table (w:tbl) built from a Document AI table,
+    with the same RTL marking used everywhere else in the document."""
+    import arabic_docx
+
+    rows = list(table.header_rows) + list(table.body_rows)
+    col_count = max((len(row.cells) for row in rows), default=0)
+    if not rows or col_count == 0:
+        return
+
+    docx_table = docx_doc.add_table(rows=0, cols=col_count)
+    docx_table.style = "Table Grid"
+    for row in rows:
+        row_cells = docx_table.add_row().cells
+        for i, cell in enumerate(row.cells):
+            if i >= col_count:
+                break
+            row_cells[i].text = _layout_text(full_text, cell.layout) if cell.layout else ""
+            for paragraph in row_cells[i].paragraphs:
+                arabic_docx.mark_paragraph_rtl(paragraph)
+    arabic_docx.mark_table_rtl(docx_table)
+
+
 def _build_docx_from_ocr(document, output_path: str) -> None:
+    """Build a DOCX from a Document AI OCR response, preserving both
+    running text and any table structure the processor detected.
+
+    Document OCR (unlike Form Parser) is primarily a text processor, but it
+    can still populate page.tables when it detects tabular layout — this
+    reconstructs those as real Word tables (w:tbl) instead of flattening
+    them into unstructured text. Paragraphs and tables are interleaved in
+    original reading order using their position in the document's full
+    text; paragraphs whose text falls inside a table's span are skipped so
+    table content isn't duplicated as loose text.
+    """
     from docx import Document as DocxDocument
 
     import arabic_docx
@@ -185,15 +249,37 @@ def _build_docx_from_ocr(document, output_path: str) -> None:
 
     for page_index, page in enumerate(pages):
         paragraphs = list(page.paragraphs or [])
-        lines = [_layout_text(full_text, p.layout) for p in paragraphs] if paragraphs else (
-            _layout_text(full_text, page.layout).splitlines() if page.layout else []
-        )
-        for line in lines:
-            if not line.strip():
-                continue
-            p = docx_doc.add_paragraph(line)
-            arabic_docx.mark_paragraph_rtl(p)
-            wrote_any = True
+        tables = list(page.tables or [])
+
+        if paragraphs or tables:
+            table_ranges = [_table_range(t) for t in tables]
+            blocks: list[tuple[int, str, object]] = [
+                (start, "table", t) for t, (start, end) in zip(tables, table_ranges)
+            ]
+            for para in paragraphs:
+                p_start, p_end = _text_anchor_range(para.layout)
+                if any(p_start < t_end and p_end > t_start for t_start, t_end in table_ranges):
+                    continue  # already covered by a table — skip to avoid duplicating it as text
+                text = _layout_text(full_text, para.layout)
+                if text.strip():
+                    blocks.append((p_start, "paragraph", text))
+            blocks.sort(key=lambda b: b[0])
+
+            for _start, kind, obj in blocks:
+                if kind == "table":
+                    _add_docx_table(docx_doc, full_text, obj)
+                else:
+                    p = docx_doc.add_paragraph(obj)
+                    arabic_docx.mark_paragraph_rtl(p)
+                wrote_any = True
+        elif page.layout:
+            for line in _layout_text(full_text, page.layout).splitlines():
+                if not line.strip():
+                    continue
+                p = docx_doc.add_paragraph(line)
+                arabic_docx.mark_paragraph_rtl(p)
+                wrote_any = True
+
         if page_index < len(pages) - 1:
             docx_doc.add_page_break()
 
