@@ -20,9 +20,13 @@ returns False and callers skip this module entirely):
   GOOGLE_CLOUD_PROJECT_ID
   GOOGLE_CLOUD_LOCATION                — e.g. "us"
   GOOGLE_DOCAI_OCR_PROCESSOR_ID        — "Document OCR" processor, used by
-                                          PDF→Word
+                                          PDF→Word for text
   GOOGLE_DOCAI_FORM_PROCESSOR_ID       — "Form Parser" processor, used by
-                                          PDF→Excel
+                                          PDF→Excel for everything, and by
+                                          PDF→Word for table detection
+                                          (Document OCR alone frequently
+                                          reports no tables on tabular
+                                          documents)
 
 Optional:
   GOOGLE_DOCAI_TIMEOUT_SECONDS         — per-request timeout (default 60)
@@ -38,7 +42,7 @@ from typing import Optional
 # main.py's cache keys on (provider_name, provider_version), so an
 # unbumped version means a cached result from before the change gets
 # served forever instead of a freshly regenerated one.
-DOCAI_PROVIDER_VERSION = "docai-v2-2026-08"
+DOCAI_PROVIDER_VERSION = "docai-v3-2026-08"
 DOCAI_TIMEOUT_SECONDS = int(os.environ.get("GOOGLE_DOCAI_TIMEOUT_SECONDS", "60"))
 
 # Document AI's synchronous processDocument call is capped at 15 pages for
@@ -177,34 +181,41 @@ def _layout_text(document_text: str, layout) -> str:
     return "".join(parts).strip()
 
 
-def _text_anchor_range(layout) -> tuple[int, int]:
-    """Return the (min_start, max_end) character offsets a Layout's
-    text_anchor covers in the document's full text. Used to detect overlap
-    between a paragraph and a table so the same text isn't emitted twice."""
-    if layout is None or not layout.text_anchor.text_segments:
-        return (0, 0)
-    starts = []
-    ends = []
-    for seg in layout.text_anchor.text_segments:
-        starts.append(int(seg.start_index) if seg.start_index else 0)
-        ends.append(int(seg.end_index))
-    return (min(starts), max(ends))
+def _bbox_from_layout(layout) -> Optional[tuple[float, float, float, float]]:
+    """Return (x_min, y_min, x_max, y_max) in normalized [0,1] page
+    coordinates for a Layout's bounding_poly, or None if unavailable.
+
+    Normalized coordinates are page-geometry-based, not tied to either
+    processor's own text numbering — which is what makes them usable to
+    compare layout elements that came from two *different* Document AI
+    responses (Document OCR's paragraphs vs. Form Parser's tables) run
+    against the same PDF pages.
+    """
+    if layout is None:
+        return None
+    poly = layout.bounding_poly
+    verts = list(poly.normalized_vertices) if poly and poly.normalized_vertices else []
+    if not verts:
+        return None
+    xs = [v.x for v in verts]
+    ys = [v.y for v in verts]
+    return (min(xs), min(ys), max(xs), max(ys))
 
 
-def _table_range(table) -> tuple[int, int]:
-    """Union of every cell's text_anchor range in a Document AI table —
-    the span of full-document text this table already accounts for."""
-    starts = []
-    ends = []
-    for row in list(table.header_rows) + list(table.body_rows):
-        for cell in row.cells:
-            start, end = _text_anchor_range(cell.layout)
-            if end > start:
-                starts.append(start)
-                ends.append(end)
-    if not starts:
-        return (0, 0)
-    return (min(starts), max(ends))
+def _bbox_overlaps(a, b, threshold: float = 0.5) -> bool:
+    """True if bbox `a` has at least `threshold` fraction of its own area
+    covered by bbox `b`. Used to decide whether an OCR paragraph's region
+    is already covered by a detected table (so its text is skipped rather
+    than duplicated). Missing bounding boxes never count as overlapping —
+    better to risk a rare duplicate line than silently drop text."""
+    if a is None or b is None:
+        return False
+    ax0, ay0, ax1, ay1 = a
+    bx0, by0, bx1, by1 = b
+    iw = max(0.0, min(ax1, bx1) - max(ax0, bx0))
+    ih = max(0.0, min(ay1, by1) - max(ay0, by0))
+    a_area = max(1e-9, (ax1 - ax0) * (ay1 - ay0))
+    return (iw * ih / a_area) >= threshold
 
 
 def _add_docx_table(docx_doc, full_text: str, table) -> None:
@@ -230,61 +241,68 @@ def _add_docx_table(docx_doc, full_text: str, table) -> None:
     arabic_docx.mark_table_rtl(docx_table)
 
 
-def _build_docx_from_ocr(document, output_path: str) -> None:
-    """Build a DOCX from a Document AI OCR response, preserving both
-    running text and any table structure the processor detected.
+def _build_docx_from_ocr(ocr_document, form_document, output_path: str) -> None:
+    """Build a DOCX from Document OCR's text merged with Form Parser's
+    tables, preserving both running text and real table structure.
 
-    Document OCR (unlike Form Parser) is primarily a text processor, but it
-    can still populate page.tables when it detects tabular layout — this
-    reconstructs those as real Word tables (w:tbl) instead of flattening
-    them into unstructured text. Paragraphs and tables are interleaved in
-    original reading order using their position in the document's full
-    text; paragraphs whose text falls inside a table's span are skipped so
-    table content isn't duplicated as loose text.
+    Document OCR gives excellent Arabic text quality but frequently
+    reports no page.tables at all for documents that are visually
+    tabular (e.g. financial reports) — it's a text processor first.
+    Form Parser is the processor actually built for table detection, so
+    its tables are used here instead, keyed onto the OCR text by page
+    position (bounding boxes) rather than text offset, since the two
+    responses are independent documents with unrelated text numbering.
+
+    ``form_document`` may be None (its call failed or was skipped) — the
+    conversion still proceeds as OCR-text-only in that case rather than
+    losing the whole result over a table-detection hiccup.
     """
     from docx import Document as DocxDocument
 
     import arabic_docx
 
     docx_doc = DocxDocument()
-    full_text = document.text or ""
+    ocr_text = ocr_document.text or ""
+    form_text = form_document.text if form_document is not None else ""
     wrote_any = False
-    pages = list(document.pages)
+    ocr_pages = list(ocr_document.pages)
+    form_pages = list(form_document.pages) if form_document is not None else []
 
-    for page_index, page in enumerate(pages):
+    for page_index, page in enumerate(ocr_pages):
         paragraphs = list(page.paragraphs or [])
-        tables = list(page.tables or [])
+        form_page = form_pages[page_index] if page_index < len(form_pages) else None
+        tables = list(form_page.tables or []) if form_page is not None else []
+        table_bboxes = [_bbox_from_layout(t.layout) for t in tables]
 
         if paragraphs or tables:
-            table_ranges = [_table_range(t) for t in tables]
-            blocks: list[tuple[int, str, object]] = [
-                (start, "table", t) for t, (start, end) in zip(tables, table_ranges)
+            blocks: list[tuple[float, str, object]] = [
+                (bbox[1] if bbox else 0.0, "table", t) for t, bbox in zip(tables, table_bboxes)
             ]
             for para in paragraphs:
-                p_start, p_end = _text_anchor_range(para.layout)
-                if any(p_start < t_end and p_end > t_start for t_start, t_end in table_ranges):
-                    continue  # already covered by a table — skip to avoid duplicating it as text
-                text = _layout_text(full_text, para.layout)
+                p_bbox = _bbox_from_layout(para.layout)
+                if any(_bbox_overlaps(p_bbox, tb) for tb in table_bboxes):
+                    continue  # region already covered by a detected table — skip to avoid duplicating it as text
+                text = _layout_text(ocr_text, para.layout)
                 if text.strip():
-                    blocks.append((p_start, "paragraph", text))
+                    blocks.append((p_bbox[1] if p_bbox else 0.0, "paragraph", text))
             blocks.sort(key=lambda b: b[0])
 
-            for _start, kind, obj in blocks:
+            for _sort_key, kind, obj in blocks:
                 if kind == "table":
-                    _add_docx_table(docx_doc, full_text, obj)
+                    _add_docx_table(docx_doc, form_text, obj)
                 else:
                     p = docx_doc.add_paragraph(obj)
                     arabic_docx.mark_paragraph_rtl(p)
                 wrote_any = True
         elif page.layout:
-            for line in _layout_text(full_text, page.layout).splitlines():
+            for line in _layout_text(ocr_text, page.layout).splitlines():
                 if not line.strip():
                     continue
                 p = docx_doc.add_paragraph(line)
                 arabic_docx.mark_paragraph_rtl(p)
                 wrote_any = True
 
-        if page_index < len(pages) - 1:
+        if page_index < len(ocr_pages) - 1:
             docx_doc.add_page_break()
 
     if not wrote_any:
@@ -328,15 +346,29 @@ def _build_xlsx_from_form(document, output_path: str) -> None:
 
 
 def process_pdf_to_docx(input_path: str, output_path: str) -> None:
-    """PDF → DOCX via Document AI's Document OCR processor.
+    """PDF → DOCX via Document AI.
 
-    Raises DocAIUnavailable on any failure — the caller must catch this and
-    fall back to the self-hosted/Adobe pipeline rather than propagate it.
+    Calls the Document OCR processor for text (the source of the confirmed
+    Arabic quality improvement) and additionally calls Form Parser for
+    table detection — Document OCR alone often reports no tables at all
+    for visually tabular documents like financial reports, since it isn't
+    the processor built for that. Only a Document OCR failure raises
+    DocAIUnavailable; if the extra Form Parser call fails, the conversion
+    still proceeds as text-only rather than losing an otherwise-good
+    result over a table-detection hiccup.
+
+    Raises DocAIUnavailable on a Document OCR failure — the caller must
+    catch this and fall back to the self-hosted/Adobe pipeline rather than
+    propagate it.
     """
     try:
         _guard_page_count(input_path)
-        document = _process_document(input_path, _env("GOOGLE_DOCAI_OCR_PROCESSOR_ID"))
-        _build_docx_from_ocr(document, output_path)
+        ocr_document = _process_document(input_path, _env("GOOGLE_DOCAI_OCR_PROCESSOR_ID"))
+        try:
+            form_document = _process_document(input_path, _env("GOOGLE_DOCAI_FORM_PROCESSOR_ID"))
+        except DocAIUnavailable:
+            form_document = None
+        _build_docx_from_ocr(ocr_document, form_document, output_path)
     except DocAIUnavailable:
         raise
     except Exception as exc:
