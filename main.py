@@ -79,6 +79,7 @@ from adobe.pdfservices.operation.pdfjobs.result.export_pdf_result import ExportP
 # behavior is identical to the pre-cache codebase. Rollback = env var.
 import cache as pdf_cache
 import cache_stats
+import docai
 
 CACHE_ENABLED = os.environ.get("CACHE_ENABLED", "false").lower() == "true"
 
@@ -89,6 +90,11 @@ ADOBE_PROVIDER_VERSION = "adobe-sdk-v4-2026-08"
 # Monthly Adobe free tier — surfaced by /api/admin/cache-stats so the
 # dashboard can compute remaining quota. Bump if the paid tier is purchased.
 ADOBE_MONTHLY_QUOTA = int(os.environ.get("ADOBE_MONTHLY_QUOTA", "500"))
+
+# Monthly Google Document AI free tier (1000 pages/mo per processor as of
+# 2026 — one "transaction" here is one converted file, not one page).
+# Surfaced by /api/admin/cache-stats the same way as the Adobe quota.
+GOOGLE_DOCAI_MONTHLY_QUOTA = int(os.environ.get("GOOGLE_DOCAI_MONTHLY_QUOTA", "1000"))
 
 # Admin token gates /api/admin/cache-stats. Missing token → endpoint 401s
 # for everyone (fail closed, don't accidentally expose usage counters).
@@ -366,7 +372,12 @@ def admin_cache_stats(request: Request):
     return {
         "cache_enabled": CACHE_ENABLED,
         "adobe_provider_version": ADOBE_PROVIDER_VERSION,
-        "counters": cache_stats.snapshot(monthly_quota=ADOBE_MONTHLY_QUOTA),
+        "docai_provider_version": docai.DOCAI_PROVIDER_VERSION,
+        "docai_configured": docai.is_configured(),
+        "counters": cache_stats.snapshot(
+            monthly_quota=ADOBE_MONTHLY_QUOTA,
+            docai_monthly_quota=GOOGLE_DOCAI_MONTHLY_QUOTA,
+        ),
         "cache_health": pdf_cache.stats(),
     }
 
@@ -561,6 +572,14 @@ def process_pdf_to_xlsx(input_path: str, output_path: str) -> None:
         raise HTTPException(status_code=500, detail="فشل التحويل: لم يُنشأ ملف Excel صالح")
 
 
+def _provider_info(name: str, target_ext: str) -> tuple[str, str]:
+    if name == "docai":
+        return "docai", docai.DOCAI_PROVIDER_VERSION
+    if name == "adobe":
+        return "adobe", ADOBE_PROVIDER_VERSION
+    return f"selfhosted-{target_ext}", SELF_HOSTED_PROVIDER_VERSIONS[target_ext]
+
+
 def _convert_pdf_to_office(
     endpoint: str,
     input_path: str,
@@ -583,16 +602,20 @@ def _convert_pdf_to_office(
 
     Provider precedence:
         1. If cache HIT for the current provider+version → return the cached
-           bytes (Adobe transactions untouched)
-        2. Else if USE_ADOBE=true → call Adobe SDK
-        3. Else (default) → call LibreOffice
+           bytes (no upstream transaction spent)
+        2. Else if Document AI is configured (all GOOGLE_* env vars set) →
+           try it first for better Arabic quality. ANY failure (missing
+           creds, timeout, quota exhausted, network error, bad response)
+           falls straight through to step 3/4 — never surfaced to the user.
+        3. Else if USE_ADOBE=true → call Adobe SDK
+        4. Else (default) → call the self-hosted engine (pdf2docx / pdfplumber)
+
+    This means the tools behave exactly as before if the Document AI env
+    vars are never set — Document AI is purely additive.
     """
-    provider_name = "adobe" if USE_ADOBE else f"selfhosted-{target_ext}"
-    provider_version = (
-        ADOBE_PROVIDER_VERSION
-        if USE_ADOBE
-        else SELF_HOSTED_PROVIDER_VERSIONS[target_ext]
-    )
+    docai_available = docai.is_configured()
+    primary_name = "docai" if docai_available else ("adobe" if USE_ADOBE else "selfhosted")
+    provider_name, provider_version = _provider_info(primary_name, target_ext)
 
     key = None
     if CACHE_ENABLED:
@@ -614,24 +637,48 @@ def _convert_pdf_to_office(
             # Cache lookup broken — fall through to provider call.
             key = None
 
-    # Provider dispatch
-    if USE_ADOBE:
-        process_pdf_adobe_v4(input_path, output_path, adobe_format)
-        cache_stats.record_adobe_transaction(endpoint)
-    elif target_ext == "docx":
-        process_pdf_to_docx(input_path, output_path)
-    elif target_ext == "xlsx":
-        process_pdf_to_xlsx(input_path, output_path)
-    else:
-        raise HTTPException(status_code=500, detail=f"صيغة إخراج غير مدعومة: {target_ext}")
+    # Provider dispatch, with automatic fallback out of Document AI.
+    used_name = primary_name
+    if docai_available:
+        try:
+            if target_ext == "docx":
+                docai.process_pdf_to_docx(input_path, output_path)
+            else:
+                docai.process_pdf_to_xlsx(input_path, output_path)
+            cache_stats.record_docai_transaction(endpoint)
+        except docai.DocAIUnavailable as exc:
+            print(f"[docai] {endpoint}: falling back to the standard engine — {exc}")
+            used_name = "adobe" if USE_ADOBE else "selfhosted"
+
+    if used_name != "docai":
+        if used_name == "adobe":
+            process_pdf_adobe_v4(input_path, output_path, adobe_format)
+            cache_stats.record_adobe_transaction(endpoint)
+        elif target_ext == "docx":
+            process_pdf_to_docx(input_path, output_path)
+        elif target_ext == "xlsx":
+            process_pdf_to_xlsx(input_path, output_path)
+        else:
+            raise HTTPException(status_code=500, detail=f"صيغة إخراج غير مدعومة: {target_ext}")
 
     # Populate cache for next time — never let a cache write failure break
-    # a successful conversion.
-    if CACHE_ENABLED and key is not None:
-        try:
-            pdf_cache.put(key, output_path)
-        except Exception:
-            pass
+    # a successful conversion. If we fell back mid-request, the cache key
+    # must reflect the provider that actually ran, not the one we planned.
+    if CACHE_ENABLED:
+        if used_name != primary_name and key is not None:
+            used_provider_name, used_version = _provider_info(used_name, target_ext)
+            key = pdf_cache.CacheKey(
+                input_sha256=key.input_sha256,
+                target_format=target_ext,
+                provider_name=used_provider_name,
+                provider_version=used_version,
+                password_hash="",
+            )
+        if key is not None:
+            try:
+                pdf_cache.put(key, output_path)
+            except Exception:
+                pass
     return False
 
 

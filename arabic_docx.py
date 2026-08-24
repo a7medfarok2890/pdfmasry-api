@@ -326,6 +326,18 @@ def _restore_missing_totals(document, totals: list[str]) -> None:
         normalized_document += normalized_total
 
 
+def mark_paragraph_rtl(paragraph: Paragraph) -> None:
+    """Public wrapper around ``_mark_paragraph_rtl`` for other conversion
+    providers (e.g. docai.py) that build a docx paragraph from scratch and
+    need the same RTL alignment/bidi flags applied."""
+    _mark_paragraph_rtl(paragraph)
+
+
+def mark_table_rtl(table: Table) -> None:
+    """Public wrapper around ``_mark_table_rtl`` — see ``mark_paragraph_rtl``."""
+    _mark_table_rtl(table)
+
+
 def repair_arabic_docx(pdf_path: str, docx_path: str) -> None:
     """Repair one converted DOCX in place using its source PDF."""
     numeric_replacements = extract_numeric_replacements(pdf_path)

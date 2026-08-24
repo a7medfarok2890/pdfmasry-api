@@ -9,3 +9,4 @@ pdfplumber
 python-bidi
 python-docx
 openpyxl
+google-cloud-documentai
