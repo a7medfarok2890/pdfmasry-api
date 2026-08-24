@@ -34,7 +34,11 @@ import os
 import threading
 from typing import Optional
 
-DOCAI_PROVIDER_VERSION = "docai-v1-2026-08"
+# Bump this whenever the DOCX/XLSX-building logic below changes format —
+# main.py's cache keys on (provider_name, provider_version), so an
+# unbumped version means a cached result from before the change gets
+# served forever instead of a freshly regenerated one.
+DOCAI_PROVIDER_VERSION = "docai-v2-2026-08"
 DOCAI_TIMEOUT_SECONDS = int(os.environ.get("GOOGLE_DOCAI_TIMEOUT_SECONDS", "60"))
 
 # Document AI's synchronous processDocument call is capped at 15 pages for
