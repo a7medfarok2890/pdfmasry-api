@@ -62,6 +62,8 @@ def _load() -> dict:
         # Sanity check the shape
         if not isinstance(data, dict) or "adobe" not in data:
             return _fresh()
+        # Backfill "docai" for usage files persisted before this key existed.
+        data.setdefault("docai", {"days": {}, "created_at": _now_utc().isoformat()})
         return data
     except (OSError, json.JSONDecodeError):
         return _fresh()
@@ -71,6 +73,10 @@ def _fresh() -> dict:
     return {
         "adobe": {
             "days": {},        # {"2026-08-05": {"total": 3, "by_endpoint": {"pdf-to-word": 2, "pdf-to-excel": 1}}}
+            "created_at": _now_utc().isoformat(),
+        },
+        "docai": {
+            "days": {},        # same shape as "adobe" — Google Document AI transactions
             "created_at": _now_utc().isoformat(),
         },
     }
@@ -109,11 +115,13 @@ def record_cache_miss() -> None:
         _session_cache_misses += 1
 
 
-# ── Adobe counters (persisted, monthly rolling) ───────────────────────
+# ── Provider counters (persisted, monthly rolling) ─────────────────────
+# Shared by Adobe and Document AI — both are metered, both need the same
+# "how many calls this month" bookkeeping.
 
-def record_adobe_transaction(endpoint: str) -> None:
-    """Increment the persisted counter for a real Adobe API call.
-    Called AFTER a successful Adobe transaction (never on cache hits).
+def _record_transaction(provider_key: str, endpoint: str) -> None:
+    """Increment the persisted counter for a real upstream API call.
+    Called AFTER a successful transaction (never on cache hits).
 
     `endpoint` is the tool that consumed it — usually "pdf-to-word" or
     "pdf-to-excel". Free-form string; no validation on our side so ops
@@ -122,7 +130,7 @@ def record_adobe_transaction(endpoint: str) -> None:
     today = _now_utc().strftime("%Y-%m-%d")
     with _lock:
         data = _load()
-        days = data["adobe"]["days"]
+        days = data[provider_key]["days"]
         if today not in days:
             days[today] = {"total": 0, "by_endpoint": {}}
         days[today]["total"] += 1
@@ -139,6 +147,17 @@ def record_adobe_transaction(endpoint: str) -> None:
         _save(data)
 
 
+def record_adobe_transaction(endpoint: str) -> None:
+    """Increment the persisted counter for a real Adobe API call."""
+    _record_transaction("adobe", endpoint)
+
+
+def record_docai_transaction(endpoint: str) -> None:
+    """Increment the persisted counter for a real Google Document AI call."""
+    _record_transaction("docai", endpoint)
+    print(f"[docai] transaction recorded — endpoint={endpoint}")
+
+
 def _day_to_epoch(day_str: str) -> float:
     """Parse 'YYYY-MM-DD' → UTC epoch of midnight. Malformed → 0 (treated
     as ancient, will be pruned).
@@ -152,39 +171,60 @@ def _day_to_epoch(day_str: str) -> float:
 
 # ── Public snapshot for the admin endpoint ────────────────────────────
 
-def snapshot(monthly_quota: int = 500) -> dict:
+def _month_summary(days: dict, month_cutoff: float) -> tuple[int, dict, Optional[dict]]:
+    """Roll up a provider's `days` dict into (month_total, by_endpoint,
+    top_endpoint) for the 30-day window starting at `month_cutoff`."""
+    month_total = 0
+    by_endpoint_month: dict[str, int] = defaultdict(int)
+    for day_str, rec in days.items():
+        if _day_to_epoch(day_str) >= month_cutoff:
+            month_total += rec.get("total", 0)
+            for ep, n in rec.get("by_endpoint", {}).items():
+                by_endpoint_month[ep] += n
+
+    top_endpoint = None
+    if by_endpoint_month:
+        name, count = max(by_endpoint_month.items(), key=lambda kv: kv[1])
+        top_endpoint = {"name": name, "transactions": count}
+
+    return month_total, dict(by_endpoint_month), top_endpoint
+
+
+def _provider_quota_block(days: dict, today_str: str, month_cutoff: float, monthly_quota: int) -> dict:
+    today_total = days.get(today_str, {}).get("total", 0)
+    month_total, by_endpoint_month, top_endpoint = _month_summary(days, month_cutoff)
+    return {
+        "today": today_total,
+        "month_rolling_30d": month_total,
+        "monthly_quota": monthly_quota,
+        "remaining_this_month": max(0, monthly_quota - month_total),
+        "utilization_pct": (
+            round((month_total / monthly_quota) * 100, 2)
+            if monthly_quota > 0 else 0.0
+        ),
+        "by_endpoint_this_month": by_endpoint_month,
+        "top_endpoint": top_endpoint,
+    }
+
+
+def snapshot(monthly_quota: int = 500, docai_monthly_quota: int = 1000) -> dict:
     """Everything the /api/admin/cache-stats endpoint needs, in one call.
 
     Args:
         monthly_quota: Adobe free-tier limit — configurable so bumping to a
             paid tier only requires an env var, not a code change.
+        docai_monthly_quota: Google Document AI free-tier limit, same idea.
 
     Returns a dict; JSON-serializable; no PII of any kind.
     """
     with _lock:
         data = _load()
-        days = data["adobe"]["days"]
         now = _now_utc()
         today_str = now.strftime("%Y-%m-%d")
-
-        today_total = days.get(today_str, {}).get("total", 0)
 
         # Rolling 30-day window (calendar month approximation — good enough
         # for "how close am I to the free tier this month").
         month_cutoff = time.time() - (30 * 24 * 60 * 60)
-        month_total = 0
-        by_endpoint_month: dict[str, int] = defaultdict(int)
-        for day_str, rec in days.items():
-            if _day_to_epoch(day_str) >= month_cutoff:
-                month_total += rec.get("total", 0)
-                for ep, n in rec.get("by_endpoint", {}).items():
-                    by_endpoint_month[ep] += n
-
-        # Top endpoint by consumption this month
-        top_endpoint = None
-        if by_endpoint_month:
-            top_endpoint = max(by_endpoint_month.items(), key=lambda kv: kv[1])
-            top_endpoint = {"name": top_endpoint[0], "transactions": top_endpoint[1]}
 
         cache_total = _session_cache_hits + _session_cache_misses
         hit_rate = (
@@ -193,18 +233,8 @@ def snapshot(monthly_quota: int = 500) -> dict:
         )
 
         return {
-            "adobe": {
-                "today": today_total,
-                "month_rolling_30d": month_total,
-                "monthly_quota": monthly_quota,
-                "remaining_this_month": max(0, monthly_quota - month_total),
-                "utilization_pct": (
-                    round((month_total / monthly_quota) * 100, 2)
-                    if monthly_quota > 0 else 0.0
-                ),
-                "by_endpoint_this_month": dict(by_endpoint_month),
-                "top_endpoint": top_endpoint,
-            },
+            "adobe": _provider_quota_block(data["adobe"]["days"], today_str, month_cutoff, monthly_quota),
+            "docai": _provider_quota_block(data["docai"]["days"], today_str, month_cutoff, docai_monthly_quota),
             "cache": {
                 "session_hits": _session_cache_hits,
                 "session_misses": _session_cache_misses,
