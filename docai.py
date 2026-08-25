@@ -42,7 +42,7 @@ from typing import Optional
 # main.py's cache keys on (provider_name, provider_version), so an
 # unbumped version means a cached result from before the change gets
 # served forever instead of a freshly regenerated one.
-DOCAI_PROVIDER_VERSION = "docai-v5-2026-08"
+DOCAI_PROVIDER_VERSION = "docai-v6-2026-08"
 DOCAI_TIMEOUT_SECONDS = int(os.environ.get("GOOGLE_DOCAI_TIMEOUT_SECONDS", "60"))
 
 # Document AI's synchronous processDocument call is capped at 15 pages for
@@ -276,6 +276,23 @@ def _add_docx_table(docx_doc, full_text: str, table, table_style) -> None:
     arabic_docx.mark_table_rtl(docx_table)
 
 
+def _set_section_rtl(docx_doc) -> None:
+    """Mark the document's section itself as right-to-left, in addition
+    to each paragraph's own style. Every paragraph in this document
+    already carries bidi + right alignment via its style, which is the
+    correct per-paragraph setting — this adds the document-level flag on
+    top, matching how a fully-RTL document is described end to end
+    rather than relying solely on per-paragraph settings applying before
+    any first render."""
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+
+    sect_pr = docx_doc.sections[0]._sectPr
+    bidi_el = sect_pr.find(qn("w:bidi"))
+    if bidi_el is None:
+        sect_pr.append(OxmlElement("w:bidi"))
+
+
 def _build_docx_from_ocr(ocr_document, form_document, output_path: str) -> None:
     """Build a DOCX from Document OCR's text merged with Form Parser's
     tables, preserving both running text and real table structure.
@@ -297,6 +314,7 @@ def _build_docx_from_ocr(ocr_document, form_document, output_path: str) -> None:
     import arabic_docx
 
     docx_doc = DocxDocument()
+    _set_section_rtl(docx_doc)
 
     # RTL alignment is baked into these styles (jc="right" + bidi in the
     # style definition itself), not decided per-paragraph from that
