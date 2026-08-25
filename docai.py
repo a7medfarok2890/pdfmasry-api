@@ -42,7 +42,7 @@ from typing import Optional
 # main.py's cache keys on (provider_name, provider_version), so an
 # unbumped version means a cached result from before the change gets
 # served forever instead of a freshly regenerated one.
-DOCAI_PROVIDER_VERSION = "docai-v6-2026-08"
+DOCAI_PROVIDER_VERSION = "docai-v7-2026-08"
 DOCAI_TIMEOUT_SECONDS = int(os.environ.get("GOOGLE_DOCAI_TIMEOUT_SECONDS", "60"))
 
 # Document AI's synchronous processDocument call is capped at 15 pages for
@@ -273,7 +273,12 @@ def _add_docx_table(docx_doc, full_text: str, table, table_style) -> None:
             row_cells[i].text = _layout_text(full_text, cell.layout) if cell.layout else ""
             for paragraph in row_cells[i].paragraphs:
                 paragraph.style = table_style
-    arabic_docx.mark_table_rtl(docx_table)
+                arabic_docx.mark_paragraph_rtl(
+                    paragraph,
+                    force=True,
+                    align_to_start=True,
+                )
+    arabic_docx.mark_table_rtl(docx_table, mirror_columns=False)
 
 
 def _set_section_rtl(docx_doc) -> None:
@@ -316,8 +321,9 @@ def _build_docx_from_ocr(ocr_document, form_document, output_path: str) -> None:
     docx_doc = DocxDocument()
     _set_section_rtl(docx_doc)
 
-    # RTL alignment is baked into these styles (jc="right" + bidi in the
-    # style definition itself), not decided per-paragraph from that
+    # RTL alignment is baked into these styles (jc="left" + bidi in the
+    # style definition itself) and repeated as direct paragraph formatting,
+    # not decided per-paragraph from that
     # paragraph's own text — this document is RTL by construction end to
     # end, so a cell whose whole content is "100%" or "6,993,250" must
     # still render right-aligned, matching how other Word-generation
@@ -357,13 +363,23 @@ def _build_docx_from_ocr(ocr_document, form_document, output_path: str) -> None:
                 if kind == "table":
                     _add_docx_table(docx_doc, form_text, obj, table_style)
                 else:
-                    docx_doc.add_paragraph(obj, style=body_style)
+                    paragraph = docx_doc.add_paragraph(obj, style=body_style)
+                    arabic_docx.mark_paragraph_rtl(
+                        paragraph,
+                        force=True,
+                        align_to_start=True,
+                    )
                 wrote_any = True
         elif page.layout:
             for line in _layout_text(ocr_text, page.layout).splitlines():
                 if not line.strip():
                     continue
-                docx_doc.add_paragraph(line, style=body_style)
+                paragraph = docx_doc.add_paragraph(line, style=body_style)
+                arabic_docx.mark_paragraph_rtl(
+                    paragraph,
+                    force=True,
+                    align_to_start=True,
+                )
                 wrote_any = True
 
         if page_index < len(ocr_pages) - 1:
