@@ -42,7 +42,7 @@ from typing import Optional
 # main.py's cache keys on (provider_name, provider_version), so an
 # unbumped version means a cached result from before the change gets
 # served forever instead of a freshly regenerated one.
-DOCAI_PROVIDER_VERSION = "docai-v4-2026-08"
+DOCAI_PROVIDER_VERSION = "docai-v5-2026-08"
 DOCAI_TIMEOUT_SECONDS = int(os.environ.get("GOOGLE_DOCAI_TIMEOUT_SECONDS", "60"))
 
 # Document AI's synchronous processDocument call is capped at 15 pages for
@@ -222,19 +222,33 @@ def _set_explicit_table_borders(docx_table) -> None:
     """Set visible single-line borders directly in the table's own XML,
     rather than relying solely on the "Table Grid" style name resolving
     correctly in every Word/LibreOffice version that opens the file —
-    belt-and-suspenders so the table is never rendered borderless."""
+    belt-and-suspenders so the table is never rendered borderless.
+
+    Border weight (sz=6, i.e. 0.75pt) and zeroed cell margins match a
+    reference iLovePDF-generated docx byte-for-byte, compared directly
+    via its raw XML."""
     from docx.oxml import OxmlElement
     from docx.oxml.ns import qn
+
+    tbl_pr = docx_table._tbl.tblPr
 
     borders = OxmlElement("w:tblBorders")
     for edge in ("top", "left", "bottom", "right", "insideH", "insideV"):
         edge_el = OxmlElement(f"w:{edge}")
         edge_el.set(qn("w:val"), "single")
-        edge_el.set(qn("w:sz"), "4")
+        edge_el.set(qn("w:sz"), "6")
         edge_el.set(qn("w:space"), "0")
         edge_el.set(qn("w:color"), "000000")
         borders.append(edge_el)
-    docx_table._tbl.tblPr.append(borders)
+    tbl_pr.append(borders)
+
+    cell_margins = OxmlElement("w:tblCellMar")
+    for edge in ("top", "left", "bottom", "right"):
+        margin_el = OxmlElement(f"w:{edge}")
+        margin_el.set(qn("w:w"), "0")
+        margin_el.set(qn("w:type"), "dxa")
+        cell_margins.append(margin_el)
+    tbl_pr.append(cell_margins)
 
 
 def _add_docx_table(docx_doc, full_text: str, table, table_style) -> None:
