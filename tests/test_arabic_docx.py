@@ -106,3 +106,41 @@ def test_aligns_concatenated_and_physically_ordered_source_lines():
         "فاتورة تجريبية\n"
         "العميل: أحمد محمد — التاريخ: ٢٠٢٦/٠٨/٢١"
     )
+
+
+def test_force_rtl_matches_ilovepdf_direct_paragraph_properties():
+    document = Document()
+    paragraph = document.add_paragraph()
+    arabic_run = paragraph.add_run("التاريخ: ")
+    latin_run = paragraph.add_run("14 February 2026")
+
+    arabic_docx.mark_paragraph_rtl(
+        paragraph,
+        force=True,
+        align_to_start=True,
+    )
+
+    p_pr = paragraph._p.pPr
+    assert p_pr.find(qn("w:bidi")).get(qn("w:val")) == "1"
+    assert p_pr.find(qn("w:jc")).get(qn("w:val")) == "left"
+    assert arabic_run._r.rPr.find(qn("w:rtl")).get(qn("w:val")) == "1"
+    assert latin_run._r.rPr is None or latin_run._r.rPr.find(qn("w:rtl")) is None
+
+
+def test_docai_table_keeps_logical_column_order():
+    document = Document()
+    table = document.add_table(rows=1, cols=2)
+    table.cell(0, 0).text = "التحليل"
+    table.cell(0, 1).text = "البيان المالي"
+
+    # Simulate a stale/misapplied table flag, then ensure the Document AI
+    # path removes it instead of mirroring already-logical columns twice.
+    arabic_docx.mark_table_rtl(table)
+    assert table._tbl.tblPr.find(qn("w:bidiVisual")) is not None
+
+    arabic_docx.mark_table_rtl(table, mirror_columns=False)
+    assert table._tbl.tblPr.find(qn("w:bidiVisual")) is None
+    assert [cell.text for cell in table.rows[0].cells] == [
+        "التحليل",
+        "البيان المالي",
+    ]

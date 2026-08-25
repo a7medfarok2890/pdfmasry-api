@@ -194,28 +194,56 @@ def _ensure_child(parent, tag: str):
     return child
 
 
-def _mark_paragraph_rtl(paragraph: Paragraph) -> None:
-    if not ARABIC_RE.search(paragraph.text):
+def _mark_paragraph_rtl(
+    paragraph: Paragraph,
+    *,
+    force: bool = False,
+    align_to_start: bool = False,
+) -> None:
+    """Write Word's RTL properties directly on a paragraph.
+
+    ``align_to_start`` intentionally emits ``w:jc w:val=\"left\"`` together
+    with ``w:bidi``.  That is the OOXML combination used by the iLovePDF
+    reference: Word and LibreOffice interpret ``left`` as the logical start
+    edge once bidi is active, so the paragraph is placed on the physical
+    right.  A style-only setting is not enough for every renderer, therefore
+    Document AI output also calls this helper with ``force=True``.
+    """
+    if not force and not ARABIC_RE.search(paragraph.text):
         return
 
-    paragraph.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    paragraph.alignment = (
+        WD_ALIGN_PARAGRAPH.LEFT if align_to_start else WD_ALIGN_PARAGRAPH.RIGHT
+    )
     paragraph_properties = paragraph._p.get_or_add_pPr()
-    _ensure_child(paragraph_properties, "w:bidi")
+    bidi = _ensure_child(paragraph_properties, "w:bidi")
+    bidi.set(qn("w:val"), "1")
 
     for run in paragraph.runs:
+        # Keep pure Latin/numeric fragments LTR inside the RTL paragraph.
+        if not ARABIC_RE.search(run.text):
+            continue
         run_properties = run._r.get_or_add_rPr()
-        _ensure_child(run_properties, "w:rtl")
+        rtl = _ensure_child(run_properties, "w:rtl")
+        rtl.set(qn("w:val"), "1")
         language = _ensure_child(run_properties, "w:lang")
         language.set(qn("w:bidi"), "ar-SA")
 
 
-def _mark_table_rtl(table: Table) -> None:
+def _mark_table_rtl(table: Table, *, mirror_columns: bool = True) -> None:
     if any(ARABIC_RE.search(cell.text) for row in table.rows for cell in row.cells):
-        _ensure_child(table._tbl.tblPr, "w:bidiVisual")
+        bidi_visual = table._tbl.tblPr.find(qn("w:bidiVisual"))
+        if mirror_columns:
+            _ensure_child(table._tbl.tblPr, "w:bidiVisual")
+        elif bidi_visual is not None:
+            # Document AI already returns cells in the intended logical
+            # order.  Mirroring that order again swaps the Arabic report's
+            # first and last columns compared with the iLovePDF reference.
+            table._tbl.tblPr.remove(bidi_visual)
     for row in table.rows:
         for cell in row.cells:
             for nested in cell.tables:
-                _mark_table_rtl(nested)
+                _mark_table_rtl(nested, mirror_columns=mirror_columns)
 
 
 def _normalized_for_compare(text: str) -> str:
@@ -327,16 +355,25 @@ def _restore_missing_totals(document, totals: list[str]) -> None:
         normalized_document += normalized_total
 
 
-def mark_paragraph_rtl(paragraph: Paragraph) -> None:
+def mark_paragraph_rtl(
+    paragraph: Paragraph,
+    *,
+    force: bool = False,
+    align_to_start: bool = False,
+) -> None:
     """Public wrapper around ``_mark_paragraph_rtl`` for other conversion
     providers (e.g. docai.py) that build a docx paragraph from scratch and
     need the same RTL alignment/bidi flags applied."""
-    _mark_paragraph_rtl(paragraph)
+    _mark_paragraph_rtl(
+        paragraph,
+        force=force,
+        align_to_start=align_to_start,
+    )
 
 
-def mark_table_rtl(table: Table) -> None:
+def mark_table_rtl(table: Table, *, mirror_columns: bool = True) -> None:
     """Public wrapper around ``_mark_table_rtl`` — see ``mark_paragraph_rtl``."""
-    _mark_table_rtl(table)
+    _mark_table_rtl(table, mirror_columns=mirror_columns)
 
 
 def ensure_rtl_paragraph_style(
@@ -345,7 +382,7 @@ def ensure_rtl_paragraph_style(
     font_name: str = "Arial",
     spacing_before_twips: int | None = None,
 ):
-    """Get-or-create a paragraph style with right alignment and bidi baked
+    """Get-or-create a paragraph style with RTL start alignment and bidi baked
     into the style definition itself, rather than decided per-paragraph
     from that paragraph's own text (which is what ``mark_paragraph_rtl``
     does, correctly, for the self-hosted repair path where a document can
@@ -370,11 +407,14 @@ def ensure_rtl_paragraph_style(
 
     style = styles.add_style(style_id, WD_STYLE_TYPE.PARAGRAPH)
     style.base_style = styles["Normal"]
-    style.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    # The iLovePDF reference uses jc="left" + bidi="1".  In an RTL
+    # paragraph this is the logical start edge, rendered on the right.
+    style.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.LEFT
     style.font.name = font_name
 
     style_pPr = style.element.get_or_add_pPr()
-    _ensure_child(style_pPr, "w:bidi")
+    style_bidi = _ensure_child(style_pPr, "w:bidi")
+    style_bidi.set(qn("w:val"), "1")
     if spacing_before_twips is not None:
         spacing = _ensure_child(style_pPr, "w:spacing")
         spacing.set(qn("w:before"), str(spacing_before_twips))
