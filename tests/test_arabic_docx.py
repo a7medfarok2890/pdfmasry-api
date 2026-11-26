@@ -15,6 +15,17 @@ def test_repairs_browser_pdf_combining_mark_artifacts():
     )
 
 
+def test_repairs_lam_alef_hamza_transposition_from_bidi_round_trip():
+    # Found live: get_display()'s bidi round-trip (used throughout this
+    # module to restore logical order) transposes the lam and the hamza
+    # carrier around a lam-alef ligature.
+    assert arabic_docx.repair_arabic_combining_marks("اإليرادات") == "الإيرادات"
+    assert arabic_docx.repair_arabic_combining_marks("األرقام") == "الأرقام"
+    assert arabic_docx.repair_arabic_combining_marks("اإلجمالي") == "الإجمالي"
+    # Unaffected text stays untouched.
+    assert arabic_docx.repair_arabic_combining_marks("القاهرة") == "القاهرة"
+
+
 def test_repairs_only_numbers_confirmed_by_source_coordinates():
     replacements = {
         "١٢/٨٠/٦٢٠٢": "٢٠٢٦/٠٨/٢١",
@@ -29,6 +40,26 @@ def test_repairs_only_numbers_confirmed_by_source_coordinates():
 
     # A token that is not proven reversed by source coordinates is untouched.
     assert arabic_docx.repair_extracted_text("رقم ٢٠٢٦", replacements) == "رقم ٢٠٢٦"
+
+
+def test_repair_extracted_text_removes_stray_space_after_opening_paren():
+    assert (
+        arabic_docx.repair_extracted_text("( شركة وهمية لأغراض التجربة)", {})
+        == "(شركة وهمية لأغراض التجربة)"
+    )
+
+
+def test_repair_extracted_text_removes_stray_space_before_closing_paren():
+    assert (
+        arabic_docx.repair_extracted_text("(ج.م )", {}) == "(ج.م)"
+    )
+
+
+def test_repair_extracted_text_leaves_normal_parenthetical_text_alone():
+    assert (
+        arabic_docx.repair_extracted_text("(شركة وهمية لأغراض التجربة)", {})
+        == "(شركة وهمية لأغراض التجربة)"
+    )
 
 
 def test_repair_docx_adds_rtl_and_restores_missing_total(tmp_path, monkeypatch):
@@ -101,11 +132,20 @@ def test_aligns_concatenated_and_physically_ordered_source_lines():
     )
 
     assert matched is True
+    # A trailing space before each line break: the break itself is now a
+    # real w:br (so Word still shows separate lines), not a literal "\n"
+    # stuffed inside w:t — a reader that only looks at w:t content (as the
+    # iLovePDF-comparison tooling does) would otherwise see no separator
+    # at all between lines, which is exactly the "جميعالأرقام" bug this
+    # fixes when the same join happens mid-sentence across a wrapped line.
     assert paragraph.text == (
-        "فاتورة تجريبية PDF مصري\n"
-        "فاتورة تجريبية\n"
+        "فاتورة تجريبية PDF مصري \n"
+        "فاتورة تجريبية \n"
         "العميل: أحمد محمد — التاريخ: ٢٠٢٦/٠٨/٢١"
     )
+    # The break is a genuine OOXML element, not a character inside w:t.
+    first_run = paragraph.runs[0]
+    assert first_run._r.find(qn("w:br")) is not None
 
 
 def test_force_rtl_matches_ilovepdf_direct_paragraph_properties():
