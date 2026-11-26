@@ -80,6 +80,7 @@ from adobe.pdfservices.operation.pdfjobs.result.export_pdf_result import ExportP
 import cache as pdf_cache
 import cache_stats
 import docai
+import xlsx_builder
 
 CACHE_ENABLED = os.environ.get("CACHE_ENABLED", "false").lower() == "true"
 
@@ -510,55 +511,25 @@ def process_pdf_to_docx(input_path: str, output_path: str) -> None:
 
 
 def process_pdf_to_xlsx(input_path: str, output_path: str) -> None:
-    """PDF → XLSX via pdfplumber (table extraction) + openpyxl (writer).
+    """PDF → XLSX via pdfplumber (table + text extraction) and
+    xlsx_builder (structuring + formatting).
 
-    Each PDF page becomes its own sheet. Tables detected by pdfplumber are
-    written as-is; if a page has no detectable tables, its extracted text
-    is written as a single-column fallback so the user still gets content
-    instead of a blank sheet.
-
-    Preserves Arabic text (pdfplumber returns Unicode). No RTL formatting
-    is applied at the cell level — Excel handles that from the character
-    direction bit.
+    One sheet per logical table (continuation pages merged, not one sheet
+    per PDF page), real numbers instead of text where the source formatting
+    is unambiguous, styled header row, RTL layout for Arabic documents, and
+    any paragraph that isn't part of a table collected onto its own sheet
+    with each PDF-wrapped paragraph rejoined into a single cell.
     """
     try:
-        import pdfplumber
-        from openpyxl import Workbook
+        import pdfplumber  # noqa: F401  (import-check only; used inside xlsx_builder)
     except ImportError:
         raise HTTPException(status_code=500, detail="مكتبة التحويل غير مثبتة على الخادم")
 
     try:
-        wb = Workbook()
-        # Remove default sheet — we'll add one per page
-        default_sheet = wb.active
-        wb.remove(default_sheet)
-
-        with pdfplumber.open(input_path) as pdf:
-            if not pdf.pages:
-                raise HTTPException(status_code=500, detail="الملف لا يحتوي على صفحات")
-
-            for page_num, page in enumerate(pdf.pages, start=1):
-                sheet_name = f"Page {page_num}"[:31]  # Excel sheet name limit
-                ws = wb.create_sheet(title=sheet_name)
-                tables = page.extract_tables() or []
-                if tables:
-                    for table in tables:
-                        for row in table:
-                            # openpyxl expects a list; None cells become empty
-                            ws.append([cell if cell is not None else "" for cell in row])
-                        ws.append([])  # blank row between tables
-                else:
-                    # No tables detected — fall back to line-by-line text so
-                    # the user isn't left with an empty sheet.
-                    text = page.extract_text() or ""
-                    for line in text.splitlines():
-                        if line.strip():
-                            ws.append([line])
-
-        # Guard against a completely empty workbook (all pages truly blank)
-        if not wb.sheetnames:
-            wb.create_sheet(title="Empty")
-
+        content = xlsx_builder.extract_structured_content(input_path)
+        if not content.tables and not content.text_blocks:
+            raise HTTPException(status_code=500, detail="الملف لا يحتوي على صفحات")
+        wb = xlsx_builder.build_workbook(content)
         wb.save(output_path)
     except HTTPException:
         raise

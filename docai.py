@@ -392,36 +392,61 @@ def _build_docx_from_ocr(ocr_document, form_document, output_path: str) -> None:
 
 
 def _build_xlsx_from_form(document, output_path: str) -> None:
-    from openpyxl import Workbook
+    """Routes Document AI's Form Parser output through the same
+    xlsx_builder used by the self-hosted pdfplumber provider, so both
+    paths produce the same quality: real numbers, styled headers, one
+    sheet per logical table (merging a table that continues on the next
+    page), and reassembled paragraph text — instead of a raw "Page N"
+    text/table dump.
 
-    wb = Workbook()
-    wb.remove(wb.active)
+    Document AI returns table/page text in logical reading order already
+    (unlike naive PDF content-stream extraction), so unlike the pdfplumber
+    provider, no RTL bidi-reversal is applied here.
+    """
+    from xlsx_builder import DocumentContent, TableBlock, build_workbook
+
     full_text = document.text or ""
-    wrote_any = False
+    tables: list[TableBlock] = []
+    text_blocks: list[str] = []
+    pending_rows: list[list[str]] | None = None
+    pending_cols: int | None = None
 
-    for page_num, page in enumerate(document.pages, start=1):
-        ws = wb.create_sheet(title=f"Page {page_num}"[:31])
-        tables = list(page.tables or [])
-        if tables:
-            for table in tables:
+    for page in document.pages:
+        page_tables = list(page.tables or [])
+        if page_tables:
+            for i, table in enumerate(page_tables):
+                rows = []
                 for row in list(table.header_rows) + list(table.body_rows):
                     cells = [_layout_text(full_text, cell.layout) for cell in row.cells]
                     if any(cells):
-                        ws.append(cells)
-                        wrote_any = True
-                ws.append([])  # blank row between tables, matches self-hosted layout
+                        rows.append(cells)
+                if not rows:
+                    continue
+                cols = len(rows[0])
+                is_continuation = pending_rows is not None and i == 0 and pending_cols == cols
+                if is_continuation:
+                    body = rows[1:] if rows[0] == pending_rows[0] else rows
+                    pending_rows.extend(body)
+                else:
+                    if pending_rows is not None:
+                        tables.append(TableBlock(rows=pending_rows))
+                    pending_rows = rows
+                    pending_cols = cols
         else:
+            if pending_rows is not None:
+                tables.append(TableBlock(rows=pending_rows))
+                pending_rows = None
+                pending_cols = None
             page_text = _layout_text(full_text, page.layout) if page.layout else ""
-            for line in page_text.splitlines():
-                if line.strip():
-                    ws.append([line])
-                    wrote_any = True
+            text_blocks.extend(line.strip() for line in page_text.splitlines() if line.strip())
 
-    if not wb.sheetnames:
-        wb.create_sheet(title="Empty")
-    if not wrote_any:
+    if pending_rows is not None:
+        tables.append(TableBlock(rows=pending_rows))
+
+    if not tables and not text_blocks:
         raise DocAIUnavailable("Document AI لم يستخرج أي جداول أو نص من الملف")
 
+    wb = build_workbook(DocumentContent(tables=tables, text_blocks=text_blocks))
     wb.save(output_path)
 
 
