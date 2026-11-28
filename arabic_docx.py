@@ -40,6 +40,11 @@ ARABIC_NUMBER_RE = re.compile(
     r"(?![\u0660-\u0669])"
 )
 TOTAL_WORDS = ("الإجمالي", "الاجمالي", "الإجمالى", "المجموع", "المستحق")
+# "لا" (not), alone or with one attached conjunction letter (و/ف/ب),
+# transposed to "ال" by the bidi round-trip — see
+# repair_arabic_combining_marks. The lookahead is what makes this safe:
+# the definite article "ال" is never followed by a word boundary.
+_NEGATION_LA_RE = re.compile(r"(^|(?<=\s))([وفب]?)ال(?=[\s.,،؛:!؟]|$)")
 
 
 def _dedupe_and_order_marks(match: re.Match[str]) -> str:
@@ -89,6 +94,16 @@ def repair_arabic_combining_marks(text: str) -> str:
     # sequence "ا" + hamza-carrier + "ل" essentially never occurs
     # correctly in genuine Arabic text, so this is safe to always apply.
     text = re.sub(r"ا([إأآ])ل", r"ال\1", text)
+
+    # Same transposition, no hamza carrier this time: the standalone
+    # negation particle "لا" ("not") — alone or with a single attached
+    # conjunction letter (و/ف/ب: "ولا"/"فلا"/"بلا") — comes back as "ال".
+    # Scoped to where "لا" is a complete word (followed by whitespace,
+    # punctuation, or the end of the text): that is never true of the
+    # definite article "ال", which is always glued directly to the noun
+    # that follows it with no boundary there, so this can't misfire on an
+    # ordinary "ال..." word.
+    text = _NEGATION_LA_RE.sub(lambda m: m.group(2) + "لا", text)
 
     return unicodedata.normalize("NFC", text)
 
@@ -149,6 +164,35 @@ def repair_extracted_text(text: str, numeric_replacements: dict[str, str]) -> st
     return _fix_paren_spacing(repair_arabic_combining_marks(text))
 
 
+_HAS_LATIN_OR_DIGIT_RE = re.compile(r"[A-Za-z0-9]")
+
+
+def _restore_logical_line(visual_line: str) -> str:
+    """Converts one pdfplumber-extracted (physical left-to-right) line
+    back to logical reading order.
+
+    A pure-Arabic line (no embedded Latin letters or Western digits) is
+    correctly restored by a simple character reversal. Running
+    get_display() on top of it too, as if it needed full bidi analysis,
+    additionally (and incorrectly) mirrors parenthesis characters —
+    mirroring is a rendering-time decision, not something that should be
+    reapplied when recovering a logical string from an already-visual
+    one. Confirmed live: a line with one parenthetical aside came back
+    with both parentheses rendering in the same visual direction when
+    run through get_display, but correctly when just reversed.
+
+    A line with embedded Latin text or Western digits does need
+    get_display, to keep that embedded run in its own forward order —
+    and specifically base_dir="R" (not "L"): confirmed live that "R"
+    keeps a trailing number (the paragraph's actual logical end, e.g. a
+    year at the end of a title) at the end, where "L" left it at the
+    front instead.
+    """
+    if _HAS_LATIN_OR_DIGIT_RE.search(visual_line):
+        return get_display(visual_line, base_dir="R")
+    return visual_line[::-1]
+
+
 def extract_logical_lines(pdf_path: str) -> list[str]:
     """Return source lines in logical reading order."""
     lines: list[str] = []
@@ -156,7 +200,7 @@ def extract_logical_lines(pdf_path: str) -> list[str]:
         for page in document.pages:
             for visual_line in (page.extract_text() or "").splitlines():
                 logical = repair_arabic_combining_marks(
-                    get_display(visual_line, base_dir="L")
+                    _restore_logical_line(visual_line)
                 ).strip()
                 if logical:
                     lines.append(logical)
@@ -180,6 +224,71 @@ def extract_missing_total_lines(pdf_path: str) -> list[str]:
         ):
             totals.append(logical)
     return totals
+
+
+def extract_table_cell_lines(pdf_path: str) -> list[list[list[str]]]:
+    """Per PDF table (reading order across pages), per row, per cell: the
+    cell's logical-order text.
+
+    pdf2docx's own table-cell text extraction isn't just visually-ordered
+    for RTL cells the way a body-text line is — confirmed live, it can
+    drop a character entirely (a hamza carrier vanished from "الإيرادات",
+    not merely transposed). Rebuilding each cell from pdfplumber's own
+    word extraction and running it through the same logical-order
+    restoration used for body lines recovers the dropped character along
+    with the paren/word order, independently of whatever pdf2docx did.
+    """
+    tables: list[list[list[str]]] = []
+    with pdfplumber.open(pdf_path) as pdf:
+        for page in pdf.pages:
+            for table in page.find_tables():
+                rows: list[list[str]] = []
+                for row in table.rows:
+                    cells: list[str] = []
+                    for cell_bbox in row.cells:
+                        if cell_bbox is None:
+                            cells.append("")
+                            continue
+                        words = [w["text"] for w in page.crop(cell_bbox).extract_words()]
+                        visual_line = " ".join(words)
+                        logical = repair_arabic_combining_marks(
+                            _restore_logical_line(visual_line)
+                        ).strip()
+                        cells.append(logical)
+                    rows.append(cells)
+                tables.append(rows)
+    return tables
+
+
+def _correct_table_cell_texts(document, cell_lines: list[list[list[str]]]) -> None:
+    """Analogous to _correct_single_line_paragraph_text, but for table
+    cells: replaces a one-run cell paragraph's text with its ground-truth
+    match from extract_table_cell_lines, matched purely by position (same
+    row/column-count guard as apply_table_layouts).
+
+    Unlike the body-paragraph correction, this can't require a matching
+    character signature first — the bug being fixed is pdf2docx dropping
+    a character outright, so the (correct) ground truth and the (garbled)
+    existing text are expected to disagree on signature too.
+    """
+    for table, rows in zip(document.tables, cell_lines):
+        if len(table.rows) != len(rows):
+            continue
+        for row, row_lines in zip(table.rows, rows):
+            if len(row.cells) != len(row_lines):
+                continue
+            for cell, logical in zip(row.cells, row_lines):
+                if not logical:
+                    continue
+                for paragraph in cell.paragraphs:
+                    content_runs = [r for r in paragraph.runs if _normalized_for_compare(r.text)]
+                    if len(content_runs) != 1:
+                        continue
+                    if paragraph.text == logical:
+                        continue
+                    if _introduces_suspicious_characters(paragraph.text, logical):
+                        continue
+                    content_runs[0].text = logical
 
 
 def _iter_cell_paragraphs(cell: _Cell) -> Iterator[Paragraph]:
@@ -280,6 +389,21 @@ def _character_signature(text: str) -> Counter[str]:
     return Counter(_normalized_for_compare(text))
 
 
+# Characters a pdfplumber-sourced ground-truth line should never
+# contribute that pdf2docx's own extraction didn't already have.
+# Confirmed live: this exact PDF's font encodes an Arabic combining
+# diacritic (tanween fath, "ً") with a broken ToUnicode mapping that
+# pdfplumber decodes as a literal "&" — invisible to the character-
+# signature match above because punctuation/diacritics are stripped by
+# _normalized_for_compare, so a line otherwise identical passes as a
+# genuine match while silently injecting a stray "&".
+_SUSPICIOUS_INJECTED_CHARS = "&"
+
+
+def _introduces_suspicious_characters(original: str, candidate: str) -> bool:
+    return any(ch in candidate and ch not in original for ch in _SUSPICIOUS_INJECTED_CHARS)
+
+
 def _group_runs_by_target_texts(
     paragraph: Paragraph,
     target_texts: list[str],
@@ -313,6 +437,76 @@ def _group_runs_by_target_texts(
     if cursor != len(content_runs):
         return None
     return groups
+
+
+def _correct_single_line_paragraph_text(paragraph: Paragraph, logical_lines: list[str]) -> bool:
+    """Replaces a one-run paragraph's text with its bidi-corrected match
+    from logical_lines, when pdf2docx's own single-line extraction isn't
+    reliably in logical order.
+
+    _align_paragraph_to_source_lines only fires for a paragraph that
+    merges 2+ source lines, by design — leaving every ordinary one-line
+    paragraph entirely dependent on pdf2docx's own bidi handling for that
+    single line. Confirmed live this isn't reliable: a line mixing a
+    company name with a parenthetical aside came back with both
+    parentheses rendering in the same visual direction (should be
+    mirrored opposite ways), even though the paragraph's w:bidi/w:rtl
+    flags were correctly set — the stored character order itself was
+    wrong, not just the display properties.
+
+    Scoped to exactly one content run so it never disturbs a line pdf2docx
+    already split into multiple differently-styled runs.
+    """
+    content_runs = [r for r in paragraph.runs if _normalized_for_compare(r.text)]
+    if len(content_runs) != 1:
+        return False
+    paragraph_signature = _character_signature(paragraph.text)
+    if not paragraph_signature:
+        return False
+    matches = [line for line in logical_lines if _character_signature(line) == paragraph_signature]
+    if len(matches) != 1 or matches[0] == paragraph.text:
+        return False
+    if _introduces_suspicious_characters(paragraph.text, matches[0]):
+        return False
+    content_runs[0].text = matches[0]
+    return True
+
+
+def _run_style_key(run) -> tuple:
+    return (run.font.size, run.font.bold, run.font.color.rgb)
+
+
+def _correct_multi_run_single_line_paragraph_text(
+    paragraph: Paragraph, logical_lines: list[str]
+) -> bool:
+    """Fallback for a paragraph pdf2docx split into multiple runs that all
+    carry one single logical source line — confirmed live: a totals line
+    ("الإجمالي: 3,080,000 ج.م إيرادات | ...") came back from pdf2docx as 3
+    identically-styled runs, apparently split at its own internal
+    text-chunk boundaries rather than at a style change. That shape isn't
+    reachable by either _align_paragraph_to_source_lines (which expects
+    each run-group to match a DIFFERENT source line) or
+    _correct_single_line_paragraph_text (scoped to exactly one run).
+
+    Only collapses runs that already carry identical size/bold/color, so
+    a paragraph genuinely split across different visual styles is left
+    alone instead of silently losing that distinction.
+    """
+    content_runs = [r for r in paragraph.runs if _normalized_for_compare(r.text)]
+    if len(content_runs) < 2:
+        return False
+    if len({_run_style_key(run) for run in content_runs}) != 1:
+        return False
+    paragraph_signature = _character_signature(paragraph.text)
+    if not paragraph_signature:
+        return False
+    matches = [line for line in logical_lines if _character_signature(line) == paragraph_signature]
+    if len(matches) != 1 or matches[0] == paragraph.text:
+        return False
+    if _introduces_suspicious_characters(paragraph.text, matches[0]):
+        return False
+    _replace_paragraph_text(paragraph, matches[0])
+    return True
 
 
 def _align_paragraph_to_source_lines(
@@ -547,7 +741,7 @@ def extract_styled_lines(pdf_path: str) -> list[StyledLine]:
                         continue
                     raw_text = "".join(s.get("text", "") for s in spans)
                     fixed_text = repair_arabic_combining_marks(
-                        get_display(raw_text, base_dir="L")
+                        _restore_logical_line(raw_text)
                     ).strip()
                     if not fixed_text:
                         continue
@@ -764,7 +958,11 @@ def repair_arabic_docx(pdf_path: str, docx_path: str) -> None:
             run.text = repair_extracted_text(run.text, numeric_replacements)
 
     for paragraph in document.paragraphs:
-        _align_paragraph_to_source_lines(paragraph, logical_lines)
+        if not _align_paragraph_to_source_lines(paragraph, logical_lines):
+            if not _correct_single_line_paragraph_text(paragraph, logical_lines):
+                _correct_multi_run_single_line_paragraph_text(paragraph, logical_lines)
+
+    _correct_table_cell_texts(document, extract_table_cell_lines(pdf_path))
 
     for paragraph in _iter_all_paragraphs(document):
         _mark_paragraph_rtl(paragraph)

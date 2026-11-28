@@ -213,3 +213,74 @@ def test_scanned_image_only_pdf_does_not_crash_the_conversion(tmp_path):
     # never an exception that breaks the whole conversion.
     doc = _convert("word_scanned.pdf", tmp_path)
     assert hasattr(doc, "paragraphs")
+
+
+# ---------------------------------------------------------------------------
+# The user's own real 4-page test file (01-تقرير-مبيعات-تجريبي.pdf) — the
+# three bugs reported from direct XML comparison against this exact file.
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(scope="module")
+def real_doc(tmp_path_factory):
+    return _convert("word_sales_report_real.pdf", tmp_path_factory.mktemp("real"))
+
+
+def test_real_file_page_count_is_four(real_doc):
+    pdf_path = os.path.join(FIXTURES, "word_sales_report_real.pdf")
+    with fitz.open(pdf_path) as src:
+        assert len(src) == 4
+
+
+def test_real_file_title_has_space_before_the_trailing_year(real_doc):
+    title_para = next(p for p in real_doc.paragraphs if "تقرير المبيعات" in p.text)
+    assert "السنوي 2026" in title_para.text
+    assert "السنوي2026" not in title_para.text
+
+
+def test_real_file_parentheses_are_correctly_oriented(real_doc):
+    company_para = next(p for p in real_doc.paragraphs if "شركة المثال" in p.text)
+    text = company_para.text
+    assert text.count("(") == 1
+    assert text.count(")") == 1
+    assert text.index("(") < text.index(")")
+    assert "(شركة وهمية" in text
+
+
+def test_real_file_negation_la_is_correct_not_al(real_doc):
+    full_text = "\n".join(p.text for p in real_doc.paragraphs)
+    assert "ولا ترتبط" in full_text
+    assert "وال ترتبط" not in full_text
+
+
+def test_real_file_both_tables_present_with_correct_headers(real_doc):
+    # Tight on purpose: pdf2docx's own table-cell extraction was found to
+    # drop the hamza carrier outright ("الإيرادات" -> "اليرادات") and mis-
+    # order the parenthetical unit label ("اليرادات (ج.م" with the closing
+    # paren missing/misplaced) — a loose substring check ("يرادات" in h)
+    # would pass against that exact garbled text and miss the bug.
+    assert len(real_doc.tables) == 2
+    for table in real_doc.tables:
+        header = [c.text for c in table.rows[0].cells]
+        assert "الإيرادات (ج.م)" in header
+        assert "التكاليف (ج.م)" in header
+        assert "صافي الربح (ج.م)" in header
+
+
+def test_real_file_table_region_and_city_names_keep_their_hamza(real_doc):
+    region_table = real_doc.tables[0]
+    names = [row.cells[0].text for row in region_table.rows[1:]]
+    assert "الإسكندرية" in names
+    assert "السكندرية" not in names
+
+
+def test_real_file_totals_line_is_fully_corrected(real_doc):
+    totals_para = next(p for p in real_doc.paragraphs if "جمالي" in p.text)
+    assert totals_para.text == (
+        "الإجمالي: 3,080,000 ج.م إيرادات | 2,480,000 ج.م تكاليف | 600,000 ج.م صافي ربح"
+    )
+
+
+def test_real_file_table_numbers_are_untouched(real_doc):
+    month_table = real_doc.tables[1]
+    first_data_row = [c.text for c in month_table.rows[1].cells]
+    assert first_data_row[1:] == ["410,000", "360,000", "50,000"]
