@@ -16,6 +16,7 @@ import unicodedata
 import uuid
 from collections import Counter
 from collections.abc import Iterator
+from dataclasses import dataclass
 
 import fitz
 import pdfplumber
@@ -25,6 +26,7 @@ from docx.enum.style import WD_STYLE_TYPE
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
+from docx.shared import Inches, Pt, RGBColor
 from docx.table import _Cell, Table
 from docx.text.paragraph import Paragraph
 
@@ -38,6 +40,11 @@ ARABIC_NUMBER_RE = re.compile(
     r"(?![\u0660-\u0669])"
 )
 TOTAL_WORDS = ("الإجمالي", "الاجمالي", "الإجمالى", "المجموع", "المستحق")
+# "لا" (not), alone or with one attached conjunction letter (و/ف/ب),
+# transposed to "ال" by the bidi round-trip — see
+# repair_arabic_combining_marks. The lookahead is what makes this safe:
+# the definite article "ال" is never followed by a word boundary.
+_NEGATION_LA_RE = re.compile(r"(^|(?<=\s))([وفب]?)ال(?=[\s.,،؛:!؟]|$)")
 
 
 def _dedupe_and_order_marks(match: re.Match[str]) -> str:
@@ -78,6 +85,26 @@ def repair_arabic_combining_marks(text: str) -> str:
         lambda match: match.group(1) + match.group(2) + match.group(1),
         text,
     )
+
+    # A narrow, confirmed-safe fix for a letter-pair transposition the
+    # get_display() bidi round-trip (used throughout this module to
+    # restore logical order) introduces around a lam-alef ligature with a
+    # hamza carrier — e.g. "الإيرادات"/"الأرقام" come back as
+    # "اإليرادات"/"األرقام" (ل and the hamza-carrier swapped). The
+    # sequence "ا" + hamza-carrier + "ل" essentially never occurs
+    # correctly in genuine Arabic text, so this is safe to always apply.
+    text = re.sub(r"ا([إأآ])ل", r"ال\1", text)
+
+    # Same transposition, no hamza carrier this time: the standalone
+    # negation particle "لا" ("not") — alone or with a single attached
+    # conjunction letter (و/ف/ب: "ولا"/"فلا"/"بلا") — comes back as "ال".
+    # Scoped to where "لا" is a complete word (followed by whitespace,
+    # punctuation, or the end of the text): that is never true of the
+    # definite article "ال", which is always glued directly to the noun
+    # that follows it with no boundary there, so this can't misfire on an
+    # ordinary "ال..." word.
+    text = _NEGATION_LA_RE.sub(lambda m: m.group(2) + "لا", text)
+
     return unicodedata.normalize("NFC", text)
 
 
@@ -114,13 +141,56 @@ def extract_numeric_replacements(pdf_path: str) -> dict[str, str]:
     return replacements
 
 
+_OPEN_PAREN_SPACE_RE = re.compile(r"(\()\s+")
+_CLOSE_PAREN_SPACE_RE = re.compile(r"\s+(\))")
+
+
+def _fix_paren_spacing(text: str) -> str:
+    """Removes a stray space right after "(" or right before ")" — an
+    artifact of pdf2docx/bidi's own handling of mirrored bracket
+    characters, not something a real document intentionally does.
+    """
+    text = _OPEN_PAREN_SPACE_RE.sub(r"\1", text)
+    text = _CLOSE_PAREN_SPACE_RE.sub(r"\1", text)
+    return text
+
+
 def repair_extracted_text(text: str, numeric_replacements: dict[str, str]) -> str:
     """Repair a DOCX text run without disturbing Latin text or styling."""
     text = ARABIC_NUMBER_RE.sub(
         lambda match: numeric_replacements.get(match.group(0), match.group(0)),
         text,
     )
-    return repair_arabic_combining_marks(text)
+    return _fix_paren_spacing(repair_arabic_combining_marks(text))
+
+
+_HAS_LATIN_OR_DIGIT_RE = re.compile(r"[A-Za-z0-9]")
+
+
+def _restore_logical_line(visual_line: str) -> str:
+    """Converts one pdfplumber-extracted (physical left-to-right) line
+    back to logical reading order.
+
+    A pure-Arabic line (no embedded Latin letters or Western digits) is
+    correctly restored by a simple character reversal. Running
+    get_display() on top of it too, as if it needed full bidi analysis,
+    additionally (and incorrectly) mirrors parenthesis characters —
+    mirroring is a rendering-time decision, not something that should be
+    reapplied when recovering a logical string from an already-visual
+    one. Confirmed live: a line with one parenthetical aside came back
+    with both parentheses rendering in the same visual direction when
+    run through get_display, but correctly when just reversed.
+
+    A line with embedded Latin text or Western digits does need
+    get_display, to keep that embedded run in its own forward order —
+    and specifically base_dir="R" (not "L"): confirmed live that "R"
+    keeps a trailing number (the paragraph's actual logical end, e.g. a
+    year at the end of a title) at the end, where "L" left it at the
+    front instead.
+    """
+    if _HAS_LATIN_OR_DIGIT_RE.search(visual_line):
+        return get_display(visual_line, base_dir="R")
+    return visual_line[::-1]
 
 
 def extract_logical_lines(pdf_path: str) -> list[str]:
@@ -130,7 +200,7 @@ def extract_logical_lines(pdf_path: str) -> list[str]:
         for page in document.pages:
             for visual_line in (page.extract_text() or "").splitlines():
                 logical = repair_arabic_combining_marks(
-                    get_display(visual_line, base_dir="L")
+                    _restore_logical_line(visual_line)
                 ).strip()
                 if logical:
                     lines.append(logical)
@@ -154,6 +224,71 @@ def extract_missing_total_lines(pdf_path: str) -> list[str]:
         ):
             totals.append(logical)
     return totals
+
+
+def extract_table_cell_lines(pdf_path: str) -> list[list[list[str]]]:
+    """Per PDF table (reading order across pages), per row, per cell: the
+    cell's logical-order text.
+
+    pdf2docx's own table-cell text extraction isn't just visually-ordered
+    for RTL cells the way a body-text line is — confirmed live, it can
+    drop a character entirely (a hamza carrier vanished from "الإيرادات",
+    not merely transposed). Rebuilding each cell from pdfplumber's own
+    word extraction and running it through the same logical-order
+    restoration used for body lines recovers the dropped character along
+    with the paren/word order, independently of whatever pdf2docx did.
+    """
+    tables: list[list[list[str]]] = []
+    with pdfplumber.open(pdf_path) as pdf:
+        for page in pdf.pages:
+            for table in page.find_tables():
+                rows: list[list[str]] = []
+                for row in table.rows:
+                    cells: list[str] = []
+                    for cell_bbox in row.cells:
+                        if cell_bbox is None:
+                            cells.append("")
+                            continue
+                        words = [w["text"] for w in page.crop(cell_bbox).extract_words()]
+                        visual_line = " ".join(words)
+                        logical = repair_arabic_combining_marks(
+                            _restore_logical_line(visual_line)
+                        ).strip()
+                        cells.append(logical)
+                    rows.append(cells)
+                tables.append(rows)
+    return tables
+
+
+def _correct_table_cell_texts(document, cell_lines: list[list[list[str]]]) -> None:
+    """Analogous to _correct_single_line_paragraph_text, but for table
+    cells: replaces a one-run cell paragraph's text with its ground-truth
+    match from extract_table_cell_lines, matched purely by position (same
+    row/column-count guard as apply_table_layouts).
+
+    Unlike the body-paragraph correction, this can't require a matching
+    character signature first — the bug being fixed is pdf2docx dropping
+    a character outright, so the (correct) ground truth and the (garbled)
+    existing text are expected to disagree on signature too.
+    """
+    for table, rows in zip(document.tables, cell_lines):
+        if len(table.rows) != len(rows):
+            continue
+        for row, row_lines in zip(table.rows, rows):
+            if len(row.cells) != len(row_lines):
+                continue
+            for cell, logical in zip(row.cells, row_lines):
+                if not logical:
+                    continue
+                for paragraph in cell.paragraphs:
+                    content_runs = [r for r in paragraph.runs if _normalized_for_compare(r.text)]
+                    if len(content_runs) != 1:
+                        continue
+                    if paragraph.text == logical:
+                        continue
+                    if _introduces_suspicious_characters(paragraph.text, logical):
+                        continue
+                    content_runs[0].text = logical
 
 
 def _iter_cell_paragraphs(cell: _Cell) -> Iterator[Paragraph]:
@@ -254,6 +389,126 @@ def _character_signature(text: str) -> Counter[str]:
     return Counter(_normalized_for_compare(text))
 
 
+# Characters a pdfplumber-sourced ground-truth line should never
+# contribute that pdf2docx's own extraction didn't already have.
+# Confirmed live: this exact PDF's font encodes an Arabic combining
+# diacritic (tanween fath, "ً") with a broken ToUnicode mapping that
+# pdfplumber decodes as a literal "&" — invisible to the character-
+# signature match above because punctuation/diacritics are stripped by
+# _normalized_for_compare, so a line otherwise identical passes as a
+# genuine match while silently injecting a stray "&".
+_SUSPICIOUS_INJECTED_CHARS = "&"
+
+
+def _introduces_suspicious_characters(original: str, candidate: str) -> bool:
+    return any(ch in candidate and ch not in original for ch in _SUSPICIOUS_INJECTED_CHARS)
+
+
+def _group_runs_by_target_texts(
+    paragraph: Paragraph,
+    target_texts: list[str],
+) -> list[list] | None:
+    """Splits a paragraph's runs into consecutive groups, one per entry in
+    ``target_texts``, each group's combined character signature matching
+    that entry's. Returns None if the runs can't be partitioned this way
+    (every run must be consumed, in order, with an exact signature match
+    at each boundary). Shared by the text-realignment pass and the
+    PDF-style-transfer pass below — both need to know which runs
+    correspond to which original source line.
+    """
+    content_runs = [run for run in paragraph.runs if _normalized_for_compare(run.text)]
+    groups: list[list] = []
+    cursor = 0
+    for target_text in target_texts:
+        target_signature = _character_signature(target_text)
+        current_signature: Counter[str] = Counter()
+        group = []
+        while cursor < len(content_runs):
+            run = content_runs[cursor]
+            cursor += 1
+            group.append(run)
+            current_signature.update(_character_signature(run.text))
+            if current_signature == target_signature:
+                break
+        if current_signature != target_signature:
+            return None
+        groups.append(group)
+
+    if cursor != len(content_runs):
+        return None
+    return groups
+
+
+def _correct_single_line_paragraph_text(paragraph: Paragraph, logical_lines: list[str]) -> bool:
+    """Replaces a one-run paragraph's text with its bidi-corrected match
+    from logical_lines, when pdf2docx's own single-line extraction isn't
+    reliably in logical order.
+
+    _align_paragraph_to_source_lines only fires for a paragraph that
+    merges 2+ source lines, by design — leaving every ordinary one-line
+    paragraph entirely dependent on pdf2docx's own bidi handling for that
+    single line. Confirmed live this isn't reliable: a line mixing a
+    company name with a parenthetical aside came back with both
+    parentheses rendering in the same visual direction (should be
+    mirrored opposite ways), even though the paragraph's w:bidi/w:rtl
+    flags were correctly set — the stored character order itself was
+    wrong, not just the display properties.
+
+    Scoped to exactly one content run so it never disturbs a line pdf2docx
+    already split into multiple differently-styled runs.
+    """
+    content_runs = [r for r in paragraph.runs if _normalized_for_compare(r.text)]
+    if len(content_runs) != 1:
+        return False
+    paragraph_signature = _character_signature(paragraph.text)
+    if not paragraph_signature:
+        return False
+    matches = [line for line in logical_lines if _character_signature(line) == paragraph_signature]
+    if len(matches) != 1 or matches[0] == paragraph.text:
+        return False
+    if _introduces_suspicious_characters(paragraph.text, matches[0]):
+        return False
+    content_runs[0].text = matches[0]
+    return True
+
+
+def _run_style_key(run) -> tuple:
+    return (run.font.size, run.font.bold, run.font.color.rgb)
+
+
+def _correct_multi_run_single_line_paragraph_text(
+    paragraph: Paragraph, logical_lines: list[str]
+) -> bool:
+    """Fallback for a paragraph pdf2docx split into multiple runs that all
+    carry one single logical source line — confirmed live: a totals line
+    ("الإجمالي: 3,080,000 ج.م إيرادات | ...") came back from pdf2docx as 3
+    identically-styled runs, apparently split at its own internal
+    text-chunk boundaries rather than at a style change. That shape isn't
+    reachable by either _align_paragraph_to_source_lines (which expects
+    each run-group to match a DIFFERENT source line) or
+    _correct_single_line_paragraph_text (scoped to exactly one run).
+
+    Only collapses runs that already carry identical size/bold/color, so
+    a paragraph genuinely split across different visual styles is left
+    alone instead of silently losing that distinction.
+    """
+    content_runs = [r for r in paragraph.runs if _normalized_for_compare(r.text)]
+    if len(content_runs) < 2:
+        return False
+    if len({_run_style_key(run) for run in content_runs}) != 1:
+        return False
+    paragraph_signature = _character_signature(paragraph.text)
+    if not paragraph_signature:
+        return False
+    matches = [line for line in logical_lines if _character_signature(line) == paragraph_signature]
+    if len(matches) != 1 or matches[0] == paragraph.text:
+        return False
+    if _introduces_suspicious_characters(paragraph.text, matches[0]):
+        return False
+    _replace_paragraph_text(paragraph, matches[0])
+    return True
+
+
 def _align_paragraph_to_source_lines(
     paragraph: Paragraph,
     logical_lines: list[str],
@@ -284,31 +539,28 @@ def _align_paragraph_to_source_lines(
     if matched_lines is None:
         return False
 
-    content_runs = [run for run in paragraph.runs if _normalized_for_compare(run.text)]
-    groups: list[list] = []
-    cursor = 0
-    for source_line in matched_lines:
-        target_signature = _character_signature(source_line)
-        current_signature = Counter()
-        group = []
-        while cursor < len(content_runs):
-            run = content_runs[cursor]
-            cursor += 1
-            group.append(run)
-            current_signature.update(_character_signature(run.text))
-            if current_signature == target_signature:
-                break
-        if current_signature != target_signature:
-            return False
-        groups.append(group)
-
-    if cursor != len(content_runs):
+    groups = _group_runs_by_target_texts(paragraph, matched_lines)
+    if groups is None:
         return False
 
     for run in paragraph.runs:
         run.text = ""
     for index, (source_line, group) in enumerate(zip(matched_lines, groups)):
-        group[0].text = source_line + ("\n" if index < len(groups) - 1 else "")
+        is_last = index == len(groups) - 1
+        # A real w:br (not a literal "\n" stuffed into w:t, which several
+        # XML-text readers — including the one used to compare this tool's
+        # own output against a reference — silently drop) is what actually
+        # renders as a line break in Word. The line itself still needs an
+        # ordinary space character in its own text too, since a line that
+        # wrapped mid-sentence (e.g. "...جميع" / "الأرقام...") is two source
+        # lines of ONE flowing sentence, not a deliberate break, and must
+        # read as one sentence for any reader that only sees w:t content.
+        # Skipped when the line already ends in a hyphen/dash, where the
+        # words are meant to run together with no space at all.
+        ends_with_hyphen = not is_last and source_line.rstrip()[-1:] in ("-", "–", "—", "ـ")
+        group[0].text = source_line if (is_last or ends_with_hyphen) else source_line + " "
+        if not is_last:
+            group[0].add_break()
     return True
 
 
@@ -430,6 +682,266 @@ def ensure_rtl_paragraph_style(
     return style
 
 
+# ---------------------------------------------------------------------------
+# Formatting transfer: font size/bold/color, cell shading, heading styles,
+# and column widths, read directly from the source PDF
+# ---------------------------------------------------------------------------
+# pdf2docx captures some of this (cell fill color, sometimes) but not font
+# size or bold for Arabic runs at all — confirmed by converting a fully
+# styled source document to PDF and inspecting the DOCX pdf2docx produced:
+# every run came back at the Normal style's base size, regardless of its
+# size in the source. This instead reads the PDF's own text spans and
+# filled rectangles and reapplies them, matched to the (already text-
+# repaired) DOCX by content, independent of whatever pdf2docx preserved.
+#
+# Word (and LibreOffice) render Arabic text using the *complex-script*
+# run properties (w:szCs, w:bCs), not the plain ones (w:sz, w:b) that
+# python-docx's own run.font.size/bold setters write — confirmed live: a
+# run with only font.size set rendered at the paragraph style's size, not
+# the one just set, because the run's actual (Arabic) text is drawn using
+# its unset w:szCs instead. Every size/bold change below sets both.
+
+_BOLD_FLAG = 1 << 4
+DEFAULT_FONT_NAME = "Arial"
+_HEADING_MAX_WORDS = 8
+_PRINTABLE_WIDTH_INCHES = 6.5
+
+
+@dataclass
+class StyledLine:
+    text: str
+    size_pt: float
+    bold: bool
+    color_hex: str
+
+
+@dataclass
+class TableLayout:
+    column_widths_pt: list[float]
+    cell_fills: list[list[str | None]]
+
+
+def _span_color_hex(color_int: int) -> str:
+    return f"{color_int:06X}"
+
+
+def extract_styled_lines(pdf_path: str) -> list[StyledLine]:
+    """One entry per visual PDF line, in reading order, carrying its
+    dominant span's size/bold/color. "Dominant" = the longest span on
+    that line, so a lone differently-styled leading tab or trailing
+    punctuation span doesn't skew the line's represented style.
+    """
+    lines: list[StyledLine] = []
+    with fitz.open(pdf_path) as document:
+        for page in document:
+            for block in page.get_text("dict").get("blocks", []):
+                for line in block.get("lines", []):
+                    spans = [s for s in line.get("spans", []) if (s.get("text") or "").strip()]
+                    if not spans:
+                        continue
+                    raw_text = "".join(s.get("text", "") for s in spans)
+                    fixed_text = repair_arabic_combining_marks(
+                        _restore_logical_line(raw_text)
+                    ).strip()
+                    if not fixed_text:
+                        continue
+                    dominant = max(spans, key=lambda s: len(s.get("text", "")))
+                    lines.append(
+                        StyledLine(
+                            text=fixed_text,
+                            size_pt=round(float(dominant.get("size", 0)), 1),
+                            bold=bool(int(dominant.get("flags", 0)) & _BOLD_FLAG),
+                            color_hex=_span_color_hex(int(dominant.get("color", 0))),
+                        )
+                    )
+    return lines
+
+
+def _best_matching_styled_lines(
+    paragraph_text: str,
+    styled_lines: list[StyledLine],
+) -> list[StyledLine] | None:
+    """Same sliding-window character-signature search as source-line
+    realignment above, generalized to also accept a single-line exact
+    match (needed here: most paragraphs/cells are one line, and that's
+    exactly the common case formatting transfer most needs to get right).
+    """
+    paragraph_signature = _character_signature(paragraph_text)
+    if not paragraph_signature:
+        return None
+    for start in range(len(styled_lines)):
+        combined: Counter[str] = Counter()
+        for end in range(start, min(len(styled_lines), start + 8)):
+            combined.update(_character_signature(styled_lines[end].text))
+            if combined == paragraph_signature:
+                return styled_lines[start : end + 1]
+    return None
+
+
+def _apply_run_style(run, styled_line: StyledLine) -> None:
+    run.font.size = Pt(styled_line.size_pt)
+    run.font.bold = styled_line.bold
+    try:
+        run.font.color.rgb = RGBColor.from_string(styled_line.color_hex)
+    except ValueError:
+        pass
+
+    rPr = run._r.get_or_add_rPr()
+    sz_cs = _ensure_child(rPr, "w:szCs")
+    sz_cs.set(qn("w:val"), str(int(round(styled_line.size_pt * 2))))
+    existing_bold_cs = rPr.find(qn("w:bCs"))
+    if styled_line.bold:
+        if existing_bold_cs is None:
+            rPr.append(OxmlElement("w:bCs"))
+    elif existing_bold_cs is not None:
+        rPr.remove(existing_bold_cs)
+
+
+def _maybe_promote_to_heading(document, paragraph: Paragraph, styled_line: StyledLine, body_size: float) -> None:
+    """Promotes a short, visually larger-or-bold single-line paragraph to
+    Heading 1/2 — conservative on purpose: a normal paragraph that just
+    happens to be short is never touched, since it won't be both short
+    AND meaningfully larger/bolder than the body text.
+    """
+    if len(styled_line.text.split()) > _HEADING_MAX_WORDS:
+        return
+    if styled_line.size_pt >= body_size * 1.35:
+        paragraph.style = document.styles["Heading 1"]
+    elif styled_line.bold and styled_line.size_pt >= body_size * 1.1:
+        paragraph.style = document.styles["Heading 2"]
+
+
+def apply_pdf_styles(document, pdf_path: str) -> None:
+    """Applies font size/bold/color from the source PDF onto every
+    paragraph and table-cell paragraph in the DOCX, matched by text
+    content, and promotes qualifying short paragraphs to Heading 1/2.
+    """
+    styled_lines = extract_styled_lines(pdf_path)
+    if not styled_lines:
+        return
+    body_size = Counter(line.size_pt for line in styled_lines).most_common(1)[0][0]
+
+    def style_one(paragraph: Paragraph, allow_heading: bool) -> None:
+        if not paragraph.runs:
+            return
+        matched = _best_matching_styled_lines(paragraph.text, styled_lines)
+        if matched is None:
+            return
+        groups = _group_runs_by_target_texts(paragraph, [line.text for line in matched])
+        if groups is None:
+            return
+        for styled_line, group in zip(matched, groups):
+            for run in group:
+                _apply_run_style(run, styled_line)
+        if allow_heading and len(matched) == 1:
+            _maybe_promote_to_heading(document, paragraph, matched[0], body_size)
+
+    for paragraph in document.paragraphs:
+        style_one(paragraph, allow_heading=True)
+    for table in document.tables:
+        for paragraph in _iter_table_paragraphs(table):
+            style_one(paragraph, allow_heading=False)
+
+
+def _rect_fill_hex_at(rects, cx: float, cy: float) -> str | None:
+    for rect in rects:
+        if rect["x0"] <= cx <= rect["x1"] and rect["top"] <= cy <= rect["bottom"]:
+            color = rect.get("non_stroking_color")
+            if color and len(color) >= 3:
+                return "".join(f"{max(0, min(255, round(c * 255))):02X}" for c in color[:3])
+    return None
+
+
+def extract_table_layouts(pdf_path: str) -> list[TableLayout]:
+    """One TableLayout per PDF table (reading order across all pages),
+    with each cell's fill color — read from the filled rectangle drawn
+    behind it, if any — and each column's width, from the same cell
+    bounding boxes pdfplumber already uses to detect the table.
+    """
+    layouts: list[TableLayout] = []
+    with pdfplumber.open(pdf_path) as pdf:
+        for page in pdf.pages:
+            rects = [r for r in page.rects if r.get("fill")]
+            for table in page.find_tables():
+                rows = table.rows
+                if not rows or not rows[0].cells or any(c is None for c in rows[0].cells):
+                    continue
+                column_widths = [cell[2] - cell[0] for cell in rows[0].cells]
+                fills: list[list[str | None]] = []
+                for row in rows:
+                    row_fills: list[str | None] = []
+                    for cell in row.cells:
+                        if cell is None:
+                            row_fills.append(None)
+                            continue
+                        cx = (cell[0] + cell[2]) / 2
+                        cy = (cell[1] + cell[3]) / 2
+                        row_fills.append(_rect_fill_hex_at(rects, cx, cy))
+                    fills.append(row_fills)
+                layouts.append(TableLayout(column_widths_pt=column_widths, cell_fills=fills))
+    return layouts
+
+
+def _set_cell_shading(cell, color_hex: str) -> None:
+    tc_pr = cell._tc.get_or_add_tcPr()
+    existing = tc_pr.find(qn("w:shd"))
+    if existing is not None:
+        tc_pr.remove(existing)
+    shd = OxmlElement("w:shd")
+    shd.set(qn("w:val"), "clear")
+    shd.set(qn("w:color"), "auto")
+    shd.set(qn("w:fill"), color_hex)
+    tc_pr.append(shd)
+
+
+def apply_table_layouts(document, layouts: list[TableLayout]) -> None:
+    """Applies per-cell shading and proportional column widths, matched to
+    document.tables by position — skipping any table whose row/column
+    count doesn't match what was detected in the PDF, which is safer than
+    risking a shading/width applied to the wrong cells on a table
+    pdf2docx happened to structure differently.
+    """
+    for table, layout in zip(document.tables, layouts):
+        if len(table.rows) != len(layout.cell_fills):
+            continue
+        if not table.rows or len(table.rows[0].cells) != len(layout.column_widths_pt):
+            continue
+
+        table.autofit = False
+        total_pt = sum(layout.column_widths_pt) or 1.0
+        for col_idx, width_pt in enumerate(layout.column_widths_pt):
+            width_inches = _PRINTABLE_WIDTH_INCHES * (width_pt / total_pt)
+            # Both are needed: a cell's own w:tcW is what that cell uses,
+            # but Word (and LibreOffice) lay out a w:tblLayout="fixed"
+            # table from w:tblGrid's gridCol widths, which cell.width
+            # alone does NOT update — confirmed live: setting only
+            # cell.width per-cell left every column rendering at its old
+            # equal width, because the stale tblGrid still said so.
+            table.columns[col_idx].width = Inches(width_inches)
+            for row in table.rows:
+                row.cells[col_idx].width = Inches(width_inches)
+
+        for r, row in enumerate(table.rows):
+            for c, cell in enumerate(row.cells):
+                fill = layout.cell_fills[r][c] if c < len(layout.cell_fills[r]) else None
+                if fill:
+                    _set_cell_shading(cell, fill)
+
+
+def apply_default_font(document, font_name: str = DEFAULT_FONT_NAME) -> None:
+    """Sets w:rFonts ascii/hAnsi/cs on every run to a known Arabic-capable
+    font — pdf2docx leaves this unset, so the output otherwise depends on
+    whatever font Word happens to default to on the machine opening it.
+    """
+    for paragraph in _iter_all_paragraphs(document):
+        for run in paragraph.runs:
+            rPr = run._r.get_or_add_rPr()
+            fonts = _ensure_child(rPr, "w:rFonts")
+            fonts.set(qn("w:ascii"), font_name)
+            fonts.set(qn("w:hAnsi"), font_name)
+            fonts.set(qn("w:cs"), font_name)
+
+
 def repair_arabic_docx(pdf_path: str, docx_path: str) -> None:
     """Repair one converted DOCX in place using its source PDF."""
     numeric_replacements = extract_numeric_replacements(pdf_path)
@@ -446,7 +958,11 @@ def repair_arabic_docx(pdf_path: str, docx_path: str) -> None:
             run.text = repair_extracted_text(run.text, numeric_replacements)
 
     for paragraph in document.paragraphs:
-        _align_paragraph_to_source_lines(paragraph, logical_lines)
+        if not _align_paragraph_to_source_lines(paragraph, logical_lines):
+            if not _correct_single_line_paragraph_text(paragraph, logical_lines):
+                _correct_multi_run_single_line_paragraph_text(paragraph, logical_lines)
+
+    _correct_table_cell_texts(document, extract_table_cell_lines(pdf_path))
 
     for paragraph in _iter_all_paragraphs(document):
         _mark_paragraph_rtl(paragraph)
@@ -455,6 +971,18 @@ def repair_arabic_docx(pdf_path: str, docx_path: str) -> None:
         _mark_table_rtl(table)
 
     _restore_missing_totals(document, totals)
+
+    # Best-effort: formatting transfer is an enhancement on top of the
+    # text/RTL correctness this function exists to guarantee. A PDF that
+    # can't be re-read by fitz/pdfplumber for some edge-case reason should
+    # still come back as a correctly-repaired (if unstyled) document, not
+    # a hard failure of the whole conversion.
+    try:
+        apply_pdf_styles(document, pdf_path)
+        apply_table_layouts(document, extract_table_layouts(pdf_path))
+    except Exception:
+        pass
+    apply_default_font(document)
 
     temporary_path = f"{docx_path}.{uuid.uuid4().hex}.tmp"
     try:
